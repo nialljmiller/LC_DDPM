@@ -2,20 +2,22 @@
 #SBATCH --account=galacticbulge
 #SBATCH --job-name=stable_fm
 #SBATCH --partition=mb-gpu
-#SBATCH --gres=gpu:4          # Request ALL 4 GPUs on the node
-#SBATCH --nodes=1             # DataParallel cannot handle >1 node
+#SBATCH --gres=gpu:4          # Request 4 GPUs
+#SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32    # Give the GPUs plenty of CPU power
-#SBATCH --mem=0               # Request ALL available RAM on the node
+#SBATCH --cpus-per-task=32
 #SBATCH --time=24:00:00
-#SBATCH --exclusive           # Lock the node so only YOU use it
+#SBATCH --exclusive           # Gives you ALL memory and CPUs automatically
+#SBATCH --output=%x_%j.log
+#SBATCH --error=%x_%j.err
 
 zenv
-# Point to your specific source list to avoid the "scanning billions of files" hang
-# You MUST have this fits file, or the job will never start.
+
+# Run the code
+# REMINDER: Ensure train.py has "rank=list(range(torch.cuda.device_count())),"
 python train.py \
     --milestone 0 \
-    --data_dir "/project/<YOUR_PROJECT>/PRIMVS/light_curves/" \
+    --data_dir "/project/galacticbulge/PRIMVS/light_curves/" \
     --fits_file "my_source_list.fits" \
     --fits_id_column "sourceid" \
     --band Ks \
