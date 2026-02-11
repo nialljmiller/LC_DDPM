@@ -1,8 +1,3 @@
-Based on the code files provided, I have generated a comprehensive `README.md`.
-
-This README explains what the project does, how to set up the environment, how to train and generate data, and—crucially—points out specific lines of code where file paths are hardcoded (referencing the `/beegfs/...` paths seen in your scripts) so you or others can easily configure it for a new machine.
-
----
 
 # LC_DDPM (Light Curve Denoising Diffusion Probabilistic Models)
 
