@@ -15,6 +15,7 @@ Replaces DDPM with the Stable-FM framework:
 import math
 import copy
 import numpy as np
+import random
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -26,6 +27,8 @@ from pathlib import Path
 from tqdm import tqdm
 from einops import rearrange
 from time import time
+
+from primvs_api import PrimvsCatalog
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -54,14 +57,103 @@ def num_to_groups(num, divisor):
     return arr
 
 
-def delete_rand_items(mag, magerr, time_arr, phase, n):
-    """Randomly drop *n* points from a light curve (numpy-native)."""
-    keep = np.sort(np.random.choice(len(mag), len(mag) - n, replace=False))
-    return mag[keep], magerr[keep], time_arr[keep], phase[keep]
-
-
 def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
+
+
+def _delete_rand_items_3col(arr1, arr2, arr3, n):
+    """Randomly remove n items from three aligned arrays."""
+    indices = random.sample(range(len(arr1)), n)
+    mask = np.ones(len(arr1), dtype=bool)
+    mask[indices] = False
+    return arr1[mask], arr2[mask], arr3[mask]
+
+
+def tile_to_square(arr, size):
+    """
+    Tile a 1D array into a (size, size) 2D array.
+
+    The array is repeated as many times as needed to fill size*size elements,
+    then reshaped. This gives the UNet a spatially consistent input.
+
+    Args:
+        arr: 1D numpy array
+        size: target spatial dimension (both H and W)
+    Returns:
+        (size, size) numpy array
+    """
+    total = size * size
+    reps = int(np.ceil(total / len(arr)))
+    tiled = np.tile(arr, reps)[:total]
+    return tiled.reshape(size, size)
+
+
+# --------------------------------------------------------------------------- #
+#  PRIMVS data loading                                                         #
+# --------------------------------------------------------------------------- #
+
+def load_sequences_from_primvs(source_ids, data_dir, lc_size, spatial_size=128, band='Ks'):
+    """
+    Load lightcurve sequences from the PRIMVS catalog via PrimvsCatalog.
+
+    Args:
+        source_ids: list/array of VIRAC source IDs.
+        data_dir: path to the PRIMVS lightcurve data directory.
+        lc_size: minimum number of datapoints required per lightcurve.
+        spatial_size: H and W of the output 2D representation (must be divisible by 16).
+        band: photometric band to use (default 'Ks').
+
+    Returns:
+        list of numpy arrays, each shaped (3, spatial_size, spatial_size).
+        Channels are [mag, err, phase] where phase = (mjd - mjd_min) / (mjd_max - mjd_min).
+    """
+    cat = PrimvsCatalog(data_dir)
+    results = cat.get_lightcurves(source_ids)
+
+    sequences = []
+    for source_id, df in tqdm(results.items(), desc='Loading PRIMVS lightcurves'):
+        # Filter to requested band
+        subset = df[df['filter'] == band].dropna(subset=['mag', 'err']).copy()
+        if len(subset) < 2:
+            continue
+
+        mjd = subset['mjd'].values.astype(float)
+        mag = subset['mag'].values.astype(float)
+        err = subset['err'].values.astype(float)
+
+        # Sort by time
+        order = np.argsort(mjd)
+        mjd, mag, err = mjd[order], mag[order], err[order]
+
+        # Skip if not enough points
+        if len(mag) < lc_size:
+            continue
+
+        # Trim to lc_size by randomly removing excess points
+        if len(mag) > lc_size:
+            mjd, mag, err = _delete_rand_items_3col(mjd, mag, err, len(mag) - lc_size)
+
+        # Skip any NaN sequences
+        if np.any(np.isnan(mag)) or np.any(np.isnan(err)) or np.any(np.isnan(mjd)):
+            continue
+
+        # Compute phase from MJD
+        mjd_range = mjd.max() - mjd.min()
+        if mjd_range == 0:
+            continue
+        phase = (mjd - mjd.min()) / mjd_range
+
+        # Tile each channel into a (spatial_size, spatial_size) 2D array
+        sequence = np.stack((
+            tile_to_square(mag, spatial_size),
+            tile_to_square(err, spatial_size),
+            tile_to_square(phase, spatial_size),
+        ), axis=0)
+
+        sequences.append(sequence)
+
+    print(f"Loaded {len(sequences)} valid sequences from PRIMVS catalog")
+    return sequences
 
 
 # --------------------------------------------------------------------------- #
@@ -320,7 +412,7 @@ class StableFlowMatching(nn.Module):
         self,
         vector_field_fn,
         *,
-        lc_size=256,
+        spatial_size=128,
         channels=3,
         lambda_z=2.0,
         lambda_tau=1.0,
@@ -329,7 +421,7 @@ class StableFlowMatching(nn.Module):
     ):
         super().__init__()
         self.vector_field_fn = vector_field_fn
-        self.lc_size = lc_size
+        self.spatial_size = spatial_size
         self.channels = channels
         self.lambda_z = lambda_z
         self.lambda_tau = lambda_tau
@@ -417,7 +509,8 @@ class StableFlowMatching(nn.Module):
         device = next(self.vector_field_fn.parameters()).device
 
         # Initial state: z ~ N(0, I), τ = 0
-        z = torch.randn(batch_size, self.channels, self.lc_size, self.lc_size, device=device)
+        S = self.spatial_size
+        z = torch.randn(batch_size, self.channels, S, S, device=device)
 
         # Integration time T s.t. τ(T) ≈ 1
         # τ(T) = 1 - exp(-λ_τ T), so for τ ≈ 0.993: T = 5/λ_τ
@@ -443,7 +536,8 @@ class StableFlowMatching(nn.Module):
         num_steps = num_steps or self.num_sample_steps
         device = next(self.vector_field_fn.parameters()).device
 
-        z = torch.randn(batch_size, self.channels, self.lc_size, self.lc_size, device=device)
+        S = self.spatial_size
+        z = torch.randn(batch_size, self.channels, S, S, device=device)
 
         T = 5.0 / self.lambda_tau
         dt = T / num_steps
@@ -494,7 +588,7 @@ class Trainer:
         dataset,
         *,
         ema_decay=0.995,
-        lc_size=256,
+        spatial_size=128,
         train_batch_size=32,
         train_lr=2e-5,
         train_num_steps=100000,
@@ -519,7 +613,7 @@ class Trainer:
         self.sample_every = sample_every
 
         self.batch_size = train_batch_size
-        self.lc_size = lc_size
+        self.spatial_size = spatial_size
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
 

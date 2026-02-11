@@ -10,6 +10,8 @@
 
 python3 /beegfs/car/njm/DDPM/train.py \
     --milestone 0 \
+    --data_dir /media/bigdata/PRIMVS/light_curves/ \
+    --band Ks \
     --lambda_z 2.0 \
     --lambda_tau 1.0 \
     --loss_type l2
