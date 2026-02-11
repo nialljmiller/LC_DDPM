@@ -1,35 +1,44 @@
 import math
 import copy
-import numpy as np
 import torch
+from torch import nn, einsum
 import torch.nn.functional as F
-from torch import nn
-from torch.utils import data
-from torch.optim import Adam
-from torchvision import utils
+from inspect import isfunction
 from functools import partial
+
+from torch.utils import data
 from pathlib import Path
+from torch.optim import Adam
+from torchvision import transforms, utils
+from astropy.io import fits
+from PIL import Image
+import glob
+import random
+import numpy as np
 from tqdm import tqdm
 from einops import rearrange
+
 from time import time
+from primvs_api import PrimvsCatalog
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --------------------------------------------------------------------------- #
-#  Helpers                                                                     #
-# --------------------------------------------------------------------------- #
+#   _   _      _
+#  | | | | ___| |_ __   ___ _ __ ___
+#  | |_| |/ _ \ | '_ \ / _ \ '__/ __|
+#  |  _  |  __/ | |_) |  __/ |  \__ \
+#  |_| |_|\___|_| .__/ \___|_|  |___/
+#               |_|
 
 def default(val, d):
     if val is not None:
         return val
-    return d() if callable(d) else d
-
+    return d() if isfunction(d) else d
 
 def cycle(dl):
     while True:
-        for batch in dl:
-            yield batch
-
+        for data in dl:
+            yield data
 
 def num_to_groups(num, divisor):
     groups = num // divisor
@@ -39,60 +48,20 @@ def num_to_groups(num, divisor):
         arr.append(remainder)
     return arr
 
-
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-
-def noise_like(shape, device, repeat=False):
-    if repeat:
-        return torch.randn((1, *shape[1:]), device=device).repeat(
-            shape[0], *((1,) * (len(shape) - 1))
-        )
-    return torch.randn(shape, device=device)
-
-
-def cosine_beta_schedule(timesteps, s=0.008):
-    """Cosine schedule (https://openreview.net/forum?id=-NEXDKk8gZ)."""
-    steps = timesteps + 1
-    x = np.linspace(0, steps, steps)
-    alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return np.clip(betas, a_min=0, a_max=0.999)
-
-
-def delete_rand_items(mag, magerr, time_arr, phase, n):
-    """Randomly drop *n* points from a light curve (numpy-native)."""
-    keep = np.sort(np.random.choice(len(mag), len(mag) - n, replace=False))
-    return mag[keep], magerr[keep], time_arr[keep], phase[keep]
-
-
-def worker_init_fn(worker_id):
-    np.random.seed(np.random.get_state()[1][0] + worker_id)
-
-
-# --------------------------------------------------------------------------- #
-#  EMA                                                                         #
-# --------------------------------------------------------------------------- #
-
-class EMA:
+class EMA():
     def __init__(self, beta):
+        super().__init__()
         self.beta = beta
 
     def update_model_average(self, ma_model, current_model):
-        for current_params, ma_params in zip(
-            current_model.parameters(), ma_model.parameters()
-        ):
+        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
             old_weight, up_weight = ma_params.data, current_params.data
-            ma_params.data = old_weight * self.beta + (1 - self.beta) * up_weight
+            ma_params.data = self.update_average(old_weight, up_weight)
 
-
-# --------------------------------------------------------------------------- #
-#  Small modules                                                               #
-# --------------------------------------------------------------------------- #
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
 
 class Residual(nn.Module):
     def __init__(self, fn):
@@ -101,7 +70,6 @@ class Residual(nn.Module):
 
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
-
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -114,8 +82,38 @@ class SinusoidalPosEmb(nn.Module):
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
-        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
 
+class Mish(nn.Module):
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(x))
+
+class Upsample(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(dim, dim, 4, 2, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class Downsample(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, dim, 3, 2, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.InstanceNorm2d(dim, affine = True)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
 
 class Rezero(nn.Module):
     def __init__(self, fn):
@@ -126,48 +124,34 @@ class Rezero(nn.Module):
     def forward(self, x):
         return self.fn(x) * self.g
 
-
-class Upsample(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.ConvTranspose2d(dim, dim, 4, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Downsample(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv2d(dim, dim, 3, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-# --------------------------------------------------------------------------- #
-#  Building blocks                                                             #
-# --------------------------------------------------------------------------- #
+#   ____        _ _     _ _               _     _            _
+#  | __ ) _   _(_) | __| (_)_ __   __ _  | |__ | | ___   ___| | _____
+#  |  _ \| | | | | |/ _` | | '_ \ / _` | | '_ \| |/ _ \ / __| |/ / __|
+#  | |_) | |_| | | | (_| | | | | | (_| | | |_) | | (_) | (__|   <\__ \
+#  |____/ \__,_|_|_|\__,_|_|_| |_|\__, | |_.__/|_|\___/ \___|_|\_\___/
+#                                 |___/
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=16):
+    def __init__(self, dim, dim_out, groups = 16):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(dim, dim_out, 3, padding=1),
             nn.GroupNorm(groups, dim_out),
-            nn.Mish(),
+            Mish()
         )
-
     def forward(self, x):
         return self.block(x)
 
-
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim, groups=16):
+    def __init__(self, dim, dim_out, *, time_emb_dim, groups = 16):
         super().__init__()
-        self.mlp = nn.Sequential(nn.Mish(), nn.Linear(time_emb_dim, dim_out))
-        self.block1 = Block(dim, dim_out, groups=groups)
-        self.block2 = Block(dim_out, dim_out, groups=groups)
+        self.mlp = nn.Sequential(
+            Mish(),
+            nn.Linear(time_emb_dim, dim_out)
+        )
+
+        self.block1 = Block(dim, dim_out)
+        self.block2 = Block(dim_out, dim_out)
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb):
@@ -177,34 +161,45 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 
+def worker_init_fn(worker_id):
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
+
+
+
 class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
+    def __init__(self, dim, heads = 4, dim_head = 32):
         super().__init__()
         self.heads = heads
         hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)  # FIX: was *4
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 4, 1, bias = False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.to_qkv(x)
-        q, k, v = rearrange(
-            qkv, "b (qkv heads c) h w -> qkv b heads c (h w)",
-            heads=self.heads, qkv=3,
-        )
+        q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', heads = self.heads, qkv=3) ####################################
         k = k.softmax(dim=-1)
-        context = torch.einsum("bhdn,bhen->bhde", k, v)
-        out = torch.einsum("bhde,bhdn->bhen", context, q)
-        out = rearrange(out, "b heads c (h w) -> b (heads c) h w", heads=self.heads, h=h, w=w)
+        context = torch.einsum('bhdn,bhen->bhde', k, v)
+        out = torch.einsum('bhde,bhdn->bhen', context, q)
+        out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', heads=self.heads, h=h, w=w)
         return self.to_out(out)
 
-
-# --------------------------------------------------------------------------- #
-#  U-Net                                                                       #
-# --------------------------------------------------------------------------- #
+#   _   _            _                         _      _
+#  | | | |_ __   ___| |_   _ __ ___   ___   __| | ___| |
+#  | | | | '_ \ / _ \ __| | '_ ` _ \ / _ \ / _` |/ _ \ |
+#  | |_| | | | |  __/ |_  | | | | | | (_) | (_| |  __/ |
+#   \___/|_| |_|\___|\__| |_| |_| |_|\___/ \__,_|\___|_|
+# 
 
 class Unet(nn.Module):
-    def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=12, channels=3):
+    def __init__(
+        self,
+        dim,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        groups = 12,
+        channels = 3
+    ):
         super().__init__()
         self.channels = channels
 
@@ -214,8 +209,8 @@ class Unet(nn.Module):
         self.time_pos_emb = SinusoidalPosEmb(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * 4),
-            nn.Mish(),
-            nn.Linear(dim * 4, dim),
+            Mish(),
+            nn.Linear(dim * 4, dim)
         )
 
         self.downs = nn.ModuleList([])
@@ -224,35 +219,39 @@ class Unet(nn.Module):
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
+
             self.downs.append(nn.ModuleList([
-                ResnetBlock(dim_in, dim_out, time_emb_dim=dim, groups=groups),
-                ResnetBlock(dim_out, dim_out, time_emb_dim=dim, groups=groups),
+                ResnetBlock(dim_in, dim_out, time_emb_dim = dim),
+                ResnetBlock(dim_out, dim_out, time_emb_dim = dim),
                 Residual(Rezero(LinearAttention(dim_out))),
-                Downsample(dim_out) if not is_last else nn.Identity(),
+                Downsample(dim_out) if not is_last else nn.Identity()
             ]))
 
         mid_dim = dims[-1]
-        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=dim, groups=groups)
+        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim = dim)
         self.mid_attn = Residual(Rezero(LinearAttention(mid_dim)))
-        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=dim, groups=groups)
+        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim = dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind >= (num_resolutions - 1)
+
             self.ups.append(nn.ModuleList([
-                ResnetBlock(dim_out * 2, dim_in, time_emb_dim=dim, groups=groups),
-                ResnetBlock(dim_in, dim_in, time_emb_dim=dim, groups=groups),
+                ResnetBlock(dim_out * 2, dim_in, time_emb_dim = dim),
+                ResnetBlock(dim_in, dim_in, time_emb_dim = dim),
                 Residual(Rezero(LinearAttention(dim_in))),
-                Upsample(dim_in) if not is_last else nn.Identity(),
+                Upsample(dim_in) if not is_last else nn.Identity()
             ]))
 
         out_dim = default(out_dim, channels)
         self.final_conv = nn.Sequential(
-            Block(dim, dim, groups=groups),
-            nn.Conv2d(dim, out_dim, 1),
+            Block(dim, dim),
+            nn.Conv2d(dim, out_dim, 1)
         )
 
     def forward(self, x, time):
-        t = self.mlp(self.time_pos_emb(time))
+        t = self.time_pos_emb(time)
+        t = self.mlp(t)
+
         h = []
 
         for resnet, resnet2, attn, downsample in self.downs:
@@ -275,21 +274,45 @@ class Unet(nn.Module):
 
         return self.final_conv(x)
 
+#    ____                     _                   _ _  __  __           _
+#   / ___| __ _ _   _ ___ ___(_) __ _ _ __     __| (_)/ _|/ _|_   _ ___(_) ___  _ __
+#  | |  _ / _` | | | / __/ __| |/ _` | '_ \   / _` | | |_| |_| | | / __| |/ _ \| '_ \
+#  | |_| | (_| | |_| \__ \__ \ | (_| | | | | | (_| | |  _|  _| |_| \__ \ | (_) | | | |
+#   \____|\__,_|\__,_|___/___/_|\__,_|_| |_|  \__,_|_|_| |_|  \__,_|___/_|\___/|_| |_|
+#
 
-# --------------------------------------------------------------------------- #
-#  Gaussian Diffusion                                                          #
-# --------------------------------------------------------------------------- #
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+def noise_like(shape, device, repeat=False):
+    repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
+    noise = lambda: torch.randn(shape, device=device)
+    return repeat_noise() if repeat else noise()
+
+def cosine_beta_schedule(timesteps, s = 0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
+    steps = timesteps + 1
+    x = np.linspace(0, steps, steps)
+    alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return np.clip(betas, a_min = 0, a_max = 0.999)
 
 class GaussianDiffusion(nn.Module):
     def __init__(
-        self,
-        denoise_fn,
+        self, 
+        denoise_fn, 
         *,
-        lc_size=256,
-        channels=3,
-        timesteps=1000,
-        loss_type="l1",
-        betas=None,
+        lc_size = 256,
+        channels = 3,
+        timesteps = 1000, 
+        loss_type = 'l1', 
+        betas = None
     ):
         super().__init__()
         self.channels = channels
@@ -301,62 +324,66 @@ class GaussianDiffusion(nn.Module):
         else:
             betas = cosine_beta_schedule(timesteps)
 
-        alphas = 1.0 - betas
+        alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
+        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
 
-        (timesteps,) = betas.shape
+        timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
         to_torch = partial(torch.tensor, dtype=torch.float32)
 
-        self.register_buffer("betas", to_torch(betas))
-        self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
-        self.register_buffer("alphas_cumprod_prev", to_torch(alphas_cumprod_prev))
+        self.register_buffer('betas', to_torch(betas))
+        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
+        self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
 
-        self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod)))
-        self.register_buffer("log_one_minus_alphas_cumprod", to_torch(np.log(1.0 - alphas_cumprod)))
-        self.register_buffer("sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod)))
-        self.register_buffer("sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1)))
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
+        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
+        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
 
-        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        self.register_buffer("posterior_variance", to_torch(posterior_variance))
-        self.register_buffer("posterior_log_variance_clipped", to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
-        self.register_buffer("posterior_mean_coef1", to_torch(
-            betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)))
-        self.register_buffer("posterior_mean_coef2", to_torch(
-            (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)))
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+        self.register_buffer('posterior_variance', to_torch(posterior_variance))
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        self.register_buffer('posterior_mean_coef1', to_torch(
+            betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
+        self.register_buffer('posterior_mean_coef2', to_torch(
+            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        variance = extract(1.0 - self.alphas_cumprod, t, x_start.shape)
+        variance = extract(1. - self.alphas_cumprod, t, x_start.shape)
         log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised=True):
+    def p_mean_variance(self, x, t, clip_denoised: bool):
         x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_fn(x, t))
+
         if clip_denoised:
-            x_recon.clamp_(-1.0, 1.0)
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-            x_start=x_recon, x_t=x, t=t
-        )
+            x_recon.clamp_(-1., 1.)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
@@ -364,73 +391,86 @@ class GaussianDiffusion(nn.Module):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
         noise = noise_like(x.shape, device, repeat_noise)
+        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
     def p_sample_loop(self, shape):
         device = self.betas.device
+
         b = shape[0]
         img = torch.randn(shape, device=device)
-        for i in tqdm(reversed(range(self.num_timesteps)), desc="sampling", total=self.num_timesteps):
+
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size=16):
-        return self.p_sample_loop((batch_size, self.channels, self.lc_size, self.lc_size))
+    def sample(self, lc_size, batch_size = 16):
+        lc_size = self.lc_size
+        channels = self.channels
+        return self.p_sample_loop((batch_size, channels, lc_size, lc_size))
 
     @torch.no_grad()
-    def interpolate(self, x1, x2, t=None, lam=0.5):
+    def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
+
         assert x1.shape == x2.shape
 
-        t_batched = torch.full((b,), t, device=device, dtype=torch.long)
+        t_batched = torch.stack([torch.tensor(t, device=device)] * b)
         xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
 
         img = (1 - lam) * xt1 + lam * xt2
-        for i in tqdm(reversed(range(t)), desc="interpolation", total=t):
+        for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+
         return img
 
     @torch.no_grad()
     def q_then_p(self, x_start, t, batch_size=16, mask=None):
         device = self.betas.device
         if mask is not None:
-            mask = mask.unsqueeze(0).expand(batch_size, -1, -1, -1)
-            x_start = torch.where(mask, torch.tensor(-1.0, device=device), x_start)
+            mask = torch.stack([mask] * batch_size)
+            x_start = torch.where(mask == True, torch.tensor(-1.0).to("cuda"), x_start)
 
-        if t == self.num_timesteps:
-            ps = torch.randn(x_start.shape, device=device)
+        if t == 1000:
+            zs = torch.randn(x_start.shape, device=device)
         else:
-            ps = self.q_sample(x_start, torch.tensor([t] * batch_size, device=device))
-
-        for i in tqdm(reversed(range(t)), desc="domain transfer", total=t):
+            zs = self.q_sample(x_start, torch.tensor([t] * batch_size).to(device))
+        ps = zs
+        for i in tqdm(reversed(range(0, t)), desc='domain transfer time step', total=t):
             if mask is not None:
-                zs = self.q_sample(x_start, torch.tensor([i] * batch_size, device=device))
-                ps = torch.where(~mask, zs, ps)
+                zs = self.q_sample(x_start, torch.tensor([i] * batch_size).to(device))
+                ps = torch.where(mask == False, zs, ps)
+
             ps = self.p_sample(ps, torch.full((batch_size,), i, device=device, dtype=torch.long))
+
         return ps
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
+
         return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise=None):
+    def p_losses(self, x_start, t, noise = None):
+        b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_recon = self.denoise_fn(x_noisy, t)
 
-        if self.loss_type == "l1":
+        if self.loss_type == 'l1':
             loss = (noise - x_recon).abs().mean()
-        elif self.loss_type == "l2":
+        elif self.loss_type == 'l2':
             loss = F.mse_loss(noise, x_recon)
         else:
-            raise NotImplementedError(f"Unknown loss type: {self.loss_type}")
+            raise NotImplementedError()
+
         return loss
 
     def forward(self, x, *args, **kwargs):
@@ -438,56 +478,147 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         return self.p_losses(x, t, *args, **kwargs)
 
+#   ____        _                 _          _
+#  |  _ \  __ _| |_ __ _ ___  ___| |_    ___| | __ _ ___ ___
+#  | | | |/ _` | __/ _` / __|/ _ \ __|  / __| |/ _` / __/ __|
+#  | |_| | (_| | || (_| \__ \  __/ |_  | (__| | (_| \__ \__ \
+#  |____/ \__,_|\__\__,_|___/\___|\__|  \___|_|\__,_|___/___/
+# 
 
-# --------------------------------------------------------------------------- #
-#  Dataset                                                                     #
-# --------------------------------------------------------------------------- #
 
-class LightcurveDataset(data.Dataset):
-    """Dataset that loads pre-processed light curve sequences (list of numpy arrays)."""
-
-    def __init__(self, sequences):
+class StochasticCurves(data.Dataset):
+    def __init__(self, sequences, batch_size=512):
         super().__init__()
         self.sequences = sequences
+        self.batch_size = batch_size
 
     def __len__(self):
-        return len(self.sequences)
+        return int(len(self.sequences))
 
     def __getitem__(self, index):
-        return torch.tensor(self.sequences[index], dtype=torch.float32)
+        return torch.tensor(self.sequences[index])
 
 
-# --------------------------------------------------------------------------- #
-#  Trainer                                                                     #
-# --------------------------------------------------------------------------- #
+def delete_rand_items(mag, magerr, time, phase, n):
+    randomlist = random.sample(range(0, len(mag)), n)
+    mag = np.array([x for i,x in enumerate(mag) if i not in randomlist])
+    magerr = np.array([x for i,x in enumerate(magerr) if i not in randomlist])
+    time = np.array([x for i,x in enumerate(time) if i not in randomlist])
+    phase = np.array([x for i,x in enumerate(phase) if i not in randomlist])
+    return mag, magerr, time, phase
 
-class Trainer:
+
+def _delete_rand_items_3col(arr1, arr2, arr3, n):
+    """Randomly remove n items from three aligned arrays."""
+    randomlist = random.sample(range(0, len(arr1)), n)
+    mask = [i not in randomlist for i in range(len(arr1))]
+    return arr1[mask], arr2[mask], arr3[mask]
+
+
+def load_sequences_from_primvs(source_ids, data_dir, lc_size, band='Ks'):
+    """
+    Load lightcurve sequences from the PRIMVS catalog via PrimvsCatalog.
+
+    Args:
+        source_ids: list/array of VIRAC source IDs.
+        data_dir: path to the PRIMVS lightcurve data directory.
+        lc_size: target number of datapoints per lightcurve.
+        band: photometric band to use (default 'Ks').
+
+    Returns:
+        list of numpy arrays, each shaped (3, 2, 2*lc_size).
+        Channels are [mjd, mag, err], tiled to form a 2D representation.
+    """
+    cat = PrimvsCatalog(data_dir)
+    results = cat.get_lightcurves(source_ids)
+
+    sequences = []
+    for source_id, df in tqdm(results.items(), desc='Loading PRIMVS lightcurves'):
+        # Filter to requested band
+        subset = df[df['filter'] == band].dropna(subset=['mag', 'err']).copy()
+        if len(subset) < 2:
+            continue
+
+        mjd = subset['mjd'].values.astype(float)
+        mag = subset['mag'].values.astype(float)
+        err = subset['err'].values.astype(float)
+
+        # Sort by time
+        order = np.argsort(mjd)
+        mjd, mag, err = mjd[order], mag[order], err[order]
+
+        # Skip if not enough points
+        if len(mag) < lc_size:
+            continue
+
+        # Trim to lc_size by randomly removing excess points
+        if len(mag) > lc_size:
+            mjd, mag, err = _delete_rand_items_3col(mjd, mag, err, len(mag) - lc_size)
+
+        # Skip any NaN sequences
+        if np.any(np.isnan(mag)) or np.any(np.isnan(err)) or np.any(np.isnan(mjd)):
+            continue
+
+        # Tile to 2D and stack as channels: (3, 2, 2*lc_size)
+        sequence = np.stack((
+            np.tile(mjd, (2, 2)),
+            np.tile(mag, (2, 2)),
+            np.tile(err, (2, 2)),
+        ), axis=0)
+        sequences.append(sequence)
+
+    print(f"Loaded {len(sequences)} valid sequences from PRIMVS catalog")
+    return sequences
+
+
+#   _____          _                        _
+#  |_   _| __ __ _(_)_ __   ___ _ __    ___| | __ _ ___ ___
+#    | || '__/ _` | | '_ \ / _ \ '__|  / __| |/ _` / __/ __|
+#    | || | | (_| | | | | |  __/ |    | (__| | (_| \__ \__ \
+#    |_||_|  \__,_|_|_| |_|\___|_|     \___|_|\__,_|___/___/
+# 
+
+class Trainer(object):
     def __init__(
         self,
         diffusion_model,
-        dataset,
+        data_dir,
         *,
-        ema_decay=0.995,
-        lc_size=256,
-        train_batch_size=32,
-        train_lr=2e-5,
-        train_num_steps=100000,
-        gradient_accumulate_every=2,
-        step_start_ema=2000,
-        update_ema_every=10,
-        rank=None,
-        num_workers=8,
-        save_every=5000,
-        sample_every=5000,
-        logdir="./logs",
+        source_ids = None,
+        fits_file = None,
+        fits_id_column = 'sourceid',
+        band = 'Ks',
+        ema_decay = 0.995,
+        lc_size = 256,
+        train_batch_size = 32,
+        train_lr = 2e-5,
+        train_num_steps = 100000,
+        gradient_accumulate_every = 2,
+        fp16 = False,
+        step_start_ema = 2000,
+        update_ema_every = 10,
+        rank = [0, 1, 2],
+        num_workers = 128,
+        save_every = 5000,
+        sample_every = 5000,
+        logdir = './logs',
     ):
+        """
+        Args:
+            diffusion_model: the GaussianDiffusion model.
+            data_dir: path to the PRIMVS lightcurve data directory.
+            source_ids: explicit list of VIRAC source IDs to train on.
+            fits_file: path to a FITS file containing source IDs.
+                       Used only if source_ids is not provided.
+            fits_id_column: column name for source IDs in the FITS file.
+            band: photometric band to filter on (default 'Ks').
+        """
         super().__init__()
-        rank = rank or [0]
-
         self.model = torch.nn.DataParallel(diffusion_model, device_ids=rank)
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
+        self.num_workers = num_workers
         self.step_start_ema = step_start_ema
         self.save_every = save_every
         self.sample_every = sample_every
@@ -498,21 +629,35 @@ class Trainer:
         self.train_num_steps = train_num_steps
 
         self.logdir = Path(logdir)
-        self.logdir.mkdir(parents=True, exist_ok=True)
+        self.logdir.mkdir(exist_ok = True)
 
-        self.ds = dataset
+        # --- Load data via PRIMVS API ---
+        if source_ids is None:
+            if fits_file is not None:
+                from astropy.table import Table
+                tbl = Table.read(fits_file, hdu=1)
+                source_ids = tbl[fits_id_column].data
+                print(f"Read {len(source_ids)} source IDs from {fits_file}")
+            else:
+                # Fall back: discover all CSVs in the data_dir hierarchy
+                cat = PrimvsCatalog(data_dir)
+                csv_paths = list(Path(data_dir).glob('**/*.csv'))
+                source_ids = [int(p.stem) for p in csv_paths]
+                print(f"Discovered {len(source_ids)} sources in {data_dir}")
+
+        sequences = load_sequences_from_primvs(source_ids, data_dir, lc_size, band=band)
+
+        self.ds = StochasticCurves(sequences, batch_size=self.batch_size)
         self.dl = cycle(data.DataLoader(
-            self.ds,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=num_workers > 0,
-            worker_init_fn=worker_init_fn,
-        ))
+                            self.ds, batch_size=self.batch_size,
+                            shuffle=False, num_workers=self.num_workers,
+                               worker_init_fn=worker_init_fn
+                        ))
 
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
+
         self.step = 0
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -525,32 +670,33 @@ class Trainer:
         self.ema.update_model_average(self.ema_model, self.model)
 
     def save(self, milestone):
-        payload = {
-            "step": self.step,
-            "model": self.model.state_dict(),
-            "ema": self.ema_model.state_dict(),
+        data = {
+            'step': self.step,
+            'model': self.model.state_dict(),
+            'ema': self.ema_model.state_dict()
         }
-        torch.save(payload, str(self.logdir / f"{milestone:08d}-model.pt"))
+        torch.save(data, str(self.logdir / f'{milestone:08d}-model.pt'))
 
     def load(self, milestone):
-        payload = torch.load(
-            str(self.logdir / f"{milestone:08d}-model.pt"), map_location="cpu"
-        )
-        self.step = payload["step"]
-        self.model.load_state_dict(payload["model"])
-        self.ema_model.load_state_dict(payload["ema"])
+        data = torch.load(str(self.logdir / f'{milestone:08d}-model.pt'))
+
+        self.step = data['step']
+        self.model.load_state_dict(data['model'])
+        self.ema_model.load_state_dict(data['ema'])
 
     def train(self):
+
         t1 = time()
         while self.step < self.train_num_steps:
-            for _ in range(self.gradient_accumulate_every):
-                batch = next(self.dl).to(device=DEVICE, dtype=torch.float)
-                loss = self.model(batch).sum()
+            for i in range(self.gradient_accumulate_every):
+                data = next(self.dl).to(device=DEVICE, dtype=torch.float)
+                print(DEVICE)
+                loss = self.model(data).sum()
                 t0 = time()
-                print(f"{self.step}: {loss.item():.6f}  Δt: {t0 - t1:.3f}s")
+                print(f'{self.step}: {loss.item()}, delta_t: {t0 - t1:.03f}')
                 t1 = time()
-                with open(str(self.logdir / "loss.txt"), "a") as f:
-                    f.write(f"{self.step},{loss.item()}\n")
+                with open(str(self.logdir / 'loss.txt'), 'a') as df:
+                    df.write(f'{self.step},{loss.item()}\n')
                 (loss / self.gradient_accumulate_every).backward()
 
             self.opt.step()
@@ -561,17 +707,16 @@ class Trainer:
 
             if self.step % self.sample_every == 0:
                 batches = num_to_groups(18, self.batch_size)
-                all_images_list = [
-                    self.ema_model.module.sample(batch_size=n) for n in batches
-                ]
+                all_images_list = list(map(lambda n: self.ema_model.module.sample(self.lc_size, batch_size=n), batches))
                 all_images = torch.cat(all_images_list, dim=0)
-                all_images = torch.flip(all_images, dims=[1])
-                all_images = [(x - x.min()) / (x.max() - x.min() + 1e-8) for x in all_images]
-                utils.save_image(all_images, str(self.logdir / f"{self.step:08d}-sample.jpg"), nrow=6)
+                all_images = torch.flip(all_images, dims=[1]) # map channels correctly for imout
+                all_images = all_images + 1
+                all_images = list(map(lambda x: (x - x.min())/(x.max() - x.min()), all_images))
+                utils.save_image(all_images, str(self.logdir / f'{self.step:08d}-sample.jpg'), nrow=6)
 
             if self.step != 0 and self.step % self.save_every == 0:
                 self.save(self.step)
 
             self.step += 1
 
-        print("Training completed.")
+        print('training completed')
