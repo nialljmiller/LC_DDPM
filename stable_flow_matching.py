@@ -28,7 +28,8 @@ from tqdm import tqdm
 from einops import rearrange
 from time import time
 
-from primvs_api import PrimvsCatalog
+from primvs_pipeline import primvs_api as api
+PrimvsCatalog = api.PrimvsCatalog
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
