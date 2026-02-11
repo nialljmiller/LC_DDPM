@@ -85,7 +85,7 @@ def main():
         gradient_accumulate_every=2,
         ema_decay=0.995,
         num_workers=32,
-        rank=[0, 1, 2],
+        rank=list(range(torch.cuda.device_count())),
     )
 
     if args.milestone != 0:
