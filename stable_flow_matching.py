@@ -1,3 +1,17 @@
+"""
+Stable Autonomous Flow Matching for Light Curves.
+
+Based on: "Stable Autonomous Flow Matching" (Sprague et al., 2024)
+  arXiv:2402.05774
+
+Replaces DDPM with the Stable-FM framework:
+  - Augmented state (z, τ) with pseudo-time τ ∈ [0, 1]
+  - Scalar stable CCNF: v'(x|x') = [-λ_z(z-z'), -λ_τ(τ-1)]
+  - Unnormalized auto CFM loss L'_Auto (Definition 4.6)
+  - λ_z/λ_τ controls interpolation rate (Lemma 4.11, Figure 3)
+  - λ_z/λ_τ = 1 recovers OT-FM (Corollary 4.12)
+"""
+
 import math
 import copy
 import numpy as np
@@ -38,30 +52,6 @@ def num_to_groups(num, divisor):
     if remainder > 0:
         arr.append(remainder)
     return arr
-
-
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-
-def noise_like(shape, device, repeat=False):
-    if repeat:
-        return torch.randn((1, *shape[1:]), device=device).repeat(
-            shape[0], *((1,) * (len(shape) - 1))
-        )
-    return torch.randn(shape, device=device)
-
-
-def cosine_beta_schedule(timesteps, s=0.008):
-    """Cosine schedule (https://openreview.net/forum?id=-NEXDKk8gZ)."""
-    steps = timesteps + 1
-    x = np.linspace(0, steps, steps)
-    alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return np.clip(betas, a_min=0, a_max=0.999)
 
 
 def delete_rand_items(mag, magerr, time_arr, phase, n):
@@ -182,7 +172,7 @@ class LinearAttention(nn.Module):
         super().__init__()
         self.heads = heads
         hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)  # FIX: was *4
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
@@ -200,10 +190,18 @@ class LinearAttention(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-#  U-Net                                                                       #
+#  U-Net (vector field predictor)                                              #
 # --------------------------------------------------------------------------- #
 
 class Unet(nn.Module):
+    """
+    U-Net that predicts the vector field v_θ(z, τ).
+
+    Takes (z, τ) and outputs a vector field of the same spatial shape as z.
+    τ is embedded via sinusoidal positional encoding (scaled to [0, 1000]
+    for comparable frequency range to DDPM integer timesteps).
+    """
+
     def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=12, channels=3):
         super().__init__()
         self.channels = channels
@@ -251,8 +249,16 @@ class Unet(nn.Module):
             nn.Conv2d(dim, out_dim, 1),
         )
 
-    def forward(self, x, time):
-        t = self.mlp(self.time_pos_emb(time))
+    def forward(self, x, tau):
+        """
+        Args:
+            x: (B, C, H, W) spatial state z
+            tau: (B,) pseudo-time in [0, 1]
+        Returns:
+            (B, C, H, W) predicted vector field for z
+        """
+        # Scale tau to [0, 1000] for sinusoidal embedding frequency range
+        t = self.mlp(self.time_pos_emb(tau * 1000.0))
         h = []
 
         for resnet, resnet2, attn, downsample in self.downs:
@@ -277,166 +283,186 @@ class Unet(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-#  Gaussian Diffusion                                                          #
+#  Stable Flow Matching                                                        #
 # --------------------------------------------------------------------------- #
 
-class GaussianDiffusion(nn.Module):
+class StableFlowMatching(nn.Module):
+    """
+    Stable Autonomous Flow Matching (Sprague et al., 2024).
+
+    Replaces GaussianDiffusion (DDPM). Uses the scalar stable CCNF
+    (Definition 4.9) with the unnormalized auto CFM loss L'_Auto
+    (Definition 4.6).
+
+    Key parameters:
+        lambda_z:  Eigenvalue for spatial state. Controls pull toward data.
+        lambda_tau: Eigenvalue for pseudo-time. Controls τ convergence rate.
+        lambda_z / lambda_tau: Controls interpolation curvature (Figure 3).
+            = 1.0 → recovers OT-FM (Corollary 4.12)
+            > 1.0 → z converges faster than τ (sharper transition)
+
+    Training:
+        Sample τ ~ U[0,1], z₀ ~ N(0,I), z₁ from data.
+        Interpolant (Lemma 4.11):
+            z_τ = z₁ + (1-τ)^(λ_z/λ_τ) · (z₀ - z₁)
+        Target vector field (Lemma 4.10):
+            v'_z(z_τ | z₁) = -λ_z · (z_τ - z₁)
+        Loss:
+            ||v_θ(z_τ, τ) - v'_z||²
+
+    Sampling:
+        Integrate ODE from (z ~ N(0,I), τ=0):
+            dz/dt = v_θ(z, τ)
+            dτ/dt = λ_τ · (1 - τ)    [analytical: τ(t) = 1 - exp(-λ_τ·t)]
+    """
+
     def __init__(
         self,
-        denoise_fn,
+        vector_field_fn,
         *,
         lc_size=256,
         channels=3,
-        timesteps=1000,
-        loss_type="l1",
-        betas=None,
+        lambda_z=2.0,
+        lambda_tau=1.0,
+        num_sample_steps=100,
+        loss_type="l2",
     ):
         super().__init__()
-        self.channels = channels
+        self.vector_field_fn = vector_field_fn
         self.lc_size = lc_size
-        self.denoise_fn = denoise_fn
-
-        if betas is not None:
-            betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
-        else:
-            betas = cosine_beta_schedule(timesteps)
-
-        alphas = 1.0 - betas
-        alphas_cumprod = np.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
-
-        (timesteps,) = betas.shape
-        self.num_timesteps = int(timesteps)
+        self.channels = channels
+        self.lambda_z = lambda_z
+        self.lambda_tau = lambda_tau
+        self.ratio = lambda_z / lambda_tau  # λ_z / λ_τ
+        self.num_sample_steps = num_sample_steps
         self.loss_type = loss_type
 
-        to_torch = partial(torch.tensor, dtype=torch.float32)
+    def interpolate(self, z1, tau):
+        """
+        Sample from the scalar stable CCNF conditional PDF (Lemma 4.11).
 
-        self.register_buffer("betas", to_torch(betas))
-        self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
-        self.register_buffer("alphas_cumprod_prev", to_torch(alphas_cumprod_prev))
+        Given clean data z₁ (= z') and pseudo-time τ, produce:
+            z_τ = z₁ + (1-τ)^(λ_z/λ_τ) · (z₀ - z₁)
+        where z₀ ~ N(0, I).
 
-        self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod)))
-        self.register_buffer("log_one_minus_alphas_cumprod", to_torch(np.log(1.0 - alphas_cumprod)))
-        self.register_buffer("sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod)))
-        self.register_buffer("sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1)))
+        Args:
+            z1: (B, C, H, W) clean data samples
+            tau: (B,) pseudo-time values in [0, 1]
+        Returns:
+            z_tau: (B, C, H, W) interpolated noisy samples
+            z0: (B, C, H, W) the sampled noise
+        """
+        z0 = torch.randn_like(z1)
+        # alpha = (1 - τ)^(λ_z/λ_τ) — Eq. 35 with τ0=0, τ1=1
+        alpha = (1.0 - tau).pow(self.ratio).view(-1, 1, 1, 1)
+        z_tau = z1 + alpha * (z0 - z1)
+        return z_tau, z0
 
-        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        self.register_buffer("posterior_variance", to_torch(posterior_variance))
-        self.register_buffer("posterior_log_variance_clipped", to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
-        self.register_buffer("posterior_mean_coef1", to_torch(
-            betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)))
-        self.register_buffer("posterior_mean_coef2", to_torch(
-            (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)))
+    def target_vector_field(self, z_tau, z1):
+        """
+        Target CCNF vector field for z (Lemma 4.10, Eq. 29):
+            v'_z(z_τ | z₁) = -λ_z · (z_τ - z₁)
 
-    def q_mean_variance(self, x_start, t):
-        mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        variance = extract(1.0 - self.alphas_cumprod, t, x_start.shape)
-        log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
-        return mean, variance, log_variance
+        This is the gradient of H'(z|z') = ½λ_z·||z - z'||² (Def 4.8).
+        """
+        return -self.lambda_z * (z_tau - z1)
 
-    def predict_start_from_noise(self, x_t, t, noise):
-        return (
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
-        )
+    def forward(self, z1):
+        """
+        Compute the unnormalized auto CFM loss L'_Auto (Definition 4.6).
 
-    def q_posterior(self, x_start, x_t, t):
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+        Args:
+            z1: (B, C, H, W) batch of clean data
+        Returns:
+            loss: scalar
+        """
+        b = z1.shape[0]
+        device = z1.device
 
-    def p_mean_variance(self, x, t, clip_denoised=True):
-        x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_fn(x, t))
-        if clip_denoised:
-            x_recon.clamp_(-1.0, 1.0)
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-            x_start=x_recon, x_t=x, t=t
-        )
-        return model_mean, posterior_variance, posterior_log_variance
+        # Sample τ ~ U[0, 1]
+        tau = torch.rand(b, device=device)
 
-    @torch.no_grad()
-    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
-        b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
-        noise = noise_like(x.shape, device, repeat_noise)
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+        # Get interpolated sample and target
+        z_tau, _ = self.interpolate(z1, tau)
+        target = self.target_vector_field(z_tau, z1)
 
-    @torch.no_grad()
-    def p_sample_loop(self, shape):
-        device = self.betas.device
-        b = shape[0]
-        img = torch.randn(shape, device=device)
-        for i in tqdm(reversed(range(self.num_timesteps)), desc="sampling", total=self.num_timesteps):
-            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
-        return img
+        # Predict vector field
+        predicted = self.vector_field_fn(z_tau, tau)
 
-    @torch.no_grad()
-    def sample(self, batch_size=16):
-        return self.p_sample_loop((batch_size, self.channels, self.lc_size, self.lc_size))
-
-    @torch.no_grad()
-    def interpolate(self, x1, x2, t=None, lam=0.5):
-        b, *_, device = *x1.shape, x1.device
-        t = default(t, self.num_timesteps - 1)
-        assert x1.shape == x2.shape
-
-        t_batched = torch.full((b,), t, device=device, dtype=torch.long)
-        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
-
-        img = (1 - lam) * xt1 + lam * xt2
-        for i in tqdm(reversed(range(t)), desc="interpolation", total=t):
-            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
-        return img
-
-    @torch.no_grad()
-    def q_then_p(self, x_start, t, batch_size=16, mask=None):
-        device = self.betas.device
-        if mask is not None:
-            mask = mask.unsqueeze(0).expand(batch_size, -1, -1, -1)
-            x_start = torch.where(mask, torch.tensor(-1.0, device=device), x_start)
-
-        if t == self.num_timesteps:
-            ps = torch.randn(x_start.shape, device=device)
-        else:
-            ps = self.q_sample(x_start, torch.tensor([t] * batch_size, device=device))
-
-        for i in tqdm(reversed(range(t)), desc="domain transfer", total=t):
-            if mask is not None:
-                zs = self.q_sample(x_start, torch.tensor([i] * batch_size, device=device))
-                ps = torch.where(~mask, zs, ps)
-            ps = self.p_sample(ps, torch.full((batch_size,), i, device=device, dtype=torch.long))
-        return ps
-
-    def q_sample(self, x_start, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
-        )
-
-    def p_losses(self, x_start, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_recon = self.denoise_fn(x_noisy, t)
-
+        # Loss
         if self.loss_type == "l1":
-            loss = (noise - x_recon).abs().mean()
+            loss = (predicted - target).abs().mean()
         elif self.loss_type == "l2":
-            loss = F.mse_loss(noise, x_recon)
+            loss = F.mse_loss(predicted, target)
         else:
             raise NotImplementedError(f"Unknown loss type: {self.loss_type}")
+
         return loss
 
-    def forward(self, x, *args, **kwargs):
-        b, c, h, w, device = *x.shape, x.device
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(x, t, *args, **kwargs)
+    @torch.no_grad()
+    def sample(self, batch_size=16, num_steps=None):
+        """
+        Generate samples by integrating the learned ODE.
+
+        System (from Section 4.2):
+            dz/dt = v_θ(z, τ)
+            dτ/dt = λ_τ · (1 - τ)
+
+        τ has analytical solution: τ(t) = 1 - exp(-λ_τ · t)
+        We integrate to T = 5/λ_τ so that τ(T) ≈ 0.993.
+
+        Uses Euler integration. For better quality, increase num_steps.
+        """
+        num_steps = num_steps or self.num_sample_steps
+        device = next(self.vector_field_fn.parameters()).device
+
+        # Initial state: z ~ N(0, I), τ = 0
+        z = torch.randn(batch_size, self.channels, self.lc_size, self.lc_size, device=device)
+
+        # Integration time T s.t. τ(T) ≈ 1
+        # τ(T) = 1 - exp(-λ_τ T), so for τ ≈ 0.993: T = 5/λ_τ
+        T = 5.0 / self.lambda_tau
+        dt = T / num_steps
+
+        # Use analytical τ trajectory for stability
+        t_values = torch.linspace(0, T, num_steps + 1, device=device)
+        tau_values = 1.0 - torch.exp(-self.lambda_tau * t_values)
+
+        for i in tqdm(range(num_steps), desc="sampling", total=num_steps):
+            tau = tau_values[i].expand(batch_size)
+            v_z = self.vector_field_fn(z, tau)
+            z = z + v_z * dt
+
+        return z
+
+    @torch.no_grad()
+    def sample_midpoint(self, batch_size=16, num_steps=None):
+        """
+        Generate samples using midpoint (RK2) integration for better accuracy.
+        """
+        num_steps = num_steps or self.num_sample_steps
+        device = next(self.vector_field_fn.parameters()).device
+
+        z = torch.randn(batch_size, self.channels, self.lc_size, self.lc_size, device=device)
+
+        T = 5.0 / self.lambda_tau
+        dt = T / num_steps
+        t_values = torch.linspace(0, T, num_steps + 1, device=device)
+        tau_values = 1.0 - torch.exp(-self.lambda_tau * t_values)
+
+        for i in tqdm(range(num_steps), desc="sampling (midpoint)", total=num_steps):
+            tau_i = tau_values[i].expand(batch_size)
+            tau_mid = (0.5 * (tau_values[i] + tau_values[i + 1])).expand(batch_size)
+
+            # Half Euler step
+            v1 = self.vector_field_fn(z, tau_i)
+            z_mid = z + v1 * (dt / 2.0)
+
+            # Full step using midpoint velocity
+            v2 = self.vector_field_fn(z_mid, tau_mid)
+            z = z + v2 * dt
+
+        return z
 
 
 # --------------------------------------------------------------------------- #
@@ -464,7 +490,7 @@ class LightcurveDataset(data.Dataset):
 class Trainer:
     def __init__(
         self,
-        diffusion_model,
+        flow_model,
         dataset,
         *,
         ema_decay=0.995,
@@ -484,7 +510,7 @@ class Trainer:
         super().__init__()
         rank = rank or [0]
 
-        self.model = torch.nn.DataParallel(diffusion_model, device_ids=rank)
+        self.model = torch.nn.DataParallel(flow_model, device_ids=rank)
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
@@ -511,7 +537,7 @@ class Trainer:
             worker_init_fn=worker_init_fn,
         ))
 
-        self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
+        self.opt = Adam(flow_model.parameters(), lr=train_lr)
         self.step = 0
         self.reset_parameters()
 

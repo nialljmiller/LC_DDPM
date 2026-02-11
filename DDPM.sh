@@ -3,5 +3,4 @@
 #PBS -m abe
 #PBS -q gpu
 
-python3 /beegfs/car/njm/DDPM/train.py --dataset LC --milestone 177000
-
+python3 /beegfs/car/njm/DDPM/train.py --milestone 177000
