@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --account=galacticbulge
 #SBATCH --job-name=stable_fm
-#SBATCH --partition=mb-gpu
-#SBATCH --gres=gpu:4          # Request 4 GPUs
+#SBATCH --partition=mb-h100   # CORRECTED: Use 'mb-h100', 'mb-l40s', or 'mb-a30'
+#SBATCH --gres=gpu:8          # MAX CAPACITY: These nodes have 8 GPUs.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=48    # H100 nodes have 96 cores (48 per socket). 
 #SBATCH --time=24:00:00
-#SBATCH --exclusive           # Gives you ALL memory and CPUs automatically
+#SBATCH --exclusive           # Gives you the full node resources.
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.err
 
