@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-ModuleNotFoundError: No module named 'torch'
-/cm/local/apps/slurm/var/spool/job02749/slurm_script: line 58: torchrun: command not found
