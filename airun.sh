@@ -26,6 +26,8 @@
 
 set -euo pipefail
 
+
+
 echo "JOB START  : $(date)"
 echo "HOST       : $(hostname)"
 echo "WORKDIR    : $(pwd)"
@@ -42,6 +44,9 @@ if [ -f "$HOME/opt/miniforge3/etc/profile.d/conda.sh" ]; then
   . "$HOME/opt/miniforge3/etc/profile.d/conda.sh"
   conda activate ai4wy
 fi
+
+source "$HOME/opt/miniforge3/etc/profile.d/conda.sh"
+conda activate ai4wy
 
 # --- Sanity checks (won’t crash if nvidia-smi unavailable on login image)
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
