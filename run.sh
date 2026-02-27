@@ -11,14 +11,14 @@
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.err
 
-zenv
+#zenv
 
 # Run the code
 # REMINDER: Ensure train.py has "rank=list(range(torch.cuda.device_count())),"
 python train.py \
     --milestone 0 \
-    --data_dir "/project/galacticbulge/PRIMVS/light_curves/" \
-    --fits_file "my_source_list.fits" \
+    --data_dir "/cluster/medbow/project/galacticbulge/PRIMVS/light_curves" \
+    --fits_file "/cluster/medbow/project/galacticbulge/PRIMVS/catalog/PRIMVS_P.fits" \
     --fits_id_column "sourceid" \
     --band Ks \
     --lambda_z 2.0 \

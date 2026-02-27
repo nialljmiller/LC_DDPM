@@ -1,0 +1,56 @@
+W0227 12:21:29.272000 824224 site-packages/torch/distributed/run.py:852] 
+W0227 12:21:29.272000 824224 site-packages/torch/distributed/run.py:852] *****************************************
+W0227 12:21:29.272000 824224 site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0227 12:21:29.272000 824224 site-packages/torch/distributed/run.py:852] *****************************************
+Traceback (most recent call last):
+  File "/cluster/ai4wy/project/ai4wy-eap/nmille39/PRIMVS/LC_DDPM/train.py", line 4, in <module>
+Traceback (most recent call last):
+  File "/cluster/ai4wy/project/ai4wy-eap/nmille39/PRIMVS/LC_DDPM/train.py", line 4, in <module>
+    from stable_flow_matching import (
+  File "/cluster/ai4wy/project/ai4wy-eap/nmille39/PRIMVS/LC_DDPM/stable_flow_matching.py", line 27, in <module>
+    from stable_flow_matching import (
+  File "/cluster/ai4wy/project/ai4wy-eap/nmille39/PRIMVS/LC_DDPM/stable_flow_matching.py", line 27, in <module>
+    from tqdm import tqdm
+ModuleNotFoundError: No module named 'tqdm'
+    from tqdm import tqdm
+ModuleNotFoundError: No module named 'tqdm'
+W0227 12:21:42.652000 824224 site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 824293 closing signal SIGTERM
+E0227 12:21:42.721000 824224 site-packages/torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 0 (pid: 824292) of binary: /cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/bin/python
+Traceback (most recent call last):
+  File "/cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/lib/python3.12/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/lib/python3.12/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/ai4wy/home/nmille39/opt/miniforge3/envs/ai4wy/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-02-27_12:21:42
+  host      : ai4wy-201.arcc.uwyo.edu
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 824293)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-02-27_12:21:42
+  host      : ai4wy-201.arcc.uwyo.edu
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 824292)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
