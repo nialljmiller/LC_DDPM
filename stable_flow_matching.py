@@ -29,7 +29,7 @@ from einops import rearrange
 from time import time
 
 from primvs_pipeline import primvs_api as api
-PrimvsCatalog = api.PrimvsCatalog(data_dir = '/project/galacticbulge/PRIMVS/light_curves')
+PrimvsCatalog = api.PrimvsCatalog(data_dir = '/cluster/medbow/project/galacticbulge/PRIMVS/light_curves')
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
