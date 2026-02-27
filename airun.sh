@@ -48,8 +48,8 @@ command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 python -c "import torch; print('torch', torch.__version__); print('cuda', torch.cuda.is_available()); print('ngpu', torch.cuda.device_count())" || true
 
 # ---- Paths on AI4WY
-DATA_DIR="/project/ai4wy-eap/nmille39/PRIMVS/light_curves"
-FITS_FILE="/project/ai4wy-eap/nmille39/PRIMVS/catalog/PRIMVS_P.fits"
+DATA_DIR="/cluster/medbow/project/galacticbulge/PRIMVS/light_curves"
+FITS_FILE="/cluster/medbow/project/galacticbulge/PRIMVS/catalog/PRIMVS_P.fits"
 
 # ---- Run
 # For multi-GPU DDPM you typically want torchrun (DDP). This works for 1 or 2 GPUs.
