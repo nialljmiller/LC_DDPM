@@ -2,8 +2,7 @@ import argparse
 import torch
 
 from stable_flow_matching import (
-    Unet, StableFlowMatching, Trainer, LazyPrimvsDataset, 
-    load_sequences_from_primvs,
+    Unet, StableFlowMatching, Trainer, LazyPrimvsDataset,
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,16 +52,7 @@ def main():
         source_ids = [int(p.stem) for p in csv_paths]
         print(f"Discovered {len(source_ids)} sources in {args.data_dir}")
 
-    # ---- Load data via PRIMVS API ------------------------------------------
-    sequences = load_sequences_from_primvs(
-        source_ids, args.data_dir, LC_SIZE,
-        spatial_size=SPATIAL_SIZE, band=args.band,
-    )
-    
-    from astropy.table import Table
-    tbl = Table.read(args.fits_file, hdu=1)
-    source_ids = tbl[args.fits_id_column].data
-    
+    # ---- Dataset -----------------------------------------------------------
     dataset = LazyPrimvsDataset(
         source_ids,
         data_dir=args.data_dir,
@@ -70,6 +60,7 @@ def main():
         spatial_size=SPATIAL_SIZE,
         band=args.band,
     )
+
     # ---- Model -------------------------------------------------------------
     model = Unet(dim=64, dim_mults=(1, 2, 4, 8), channels=CHANNELS).to(DEVICE)
 

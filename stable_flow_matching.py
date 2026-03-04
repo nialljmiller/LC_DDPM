@@ -33,7 +33,6 @@ from primvs_pipeline import primvs_api as api
 PrimvsCatalog = api.PrimvsCatalog
 
 
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------------------------------------------------------------- #
@@ -83,7 +82,6 @@ class LazyPrimvsDataset(data.Dataset):
     """
     def __init__(self, source_ids, data_dir, lc_size=70, spatial_size=128, band="Ks"):
         super().__init__()
-        from primvs_api import PrimvsCatalog
         self.cat = PrimvsCatalog(data_dir)
         self.lc_size = lc_size
         self.spatial_size = spatial_size
@@ -131,73 +129,6 @@ class LazyPrimvsDataset(data.Dataset):
         if seq is None:
             seq = np.zeros((3, self.spatial_size, self.spatial_size), dtype=np.float32)
         return torch.from_numpy(seq)
-
-# --------------------------------------------------------------------------- #
-#  PRIMVS data loading                                                         #
-# --------------------------------------------------------------------------- #
-
-def load_sequences_from_primvs(source_ids, data_dir, lc_size, spatial_size=128, band='Ks'):
-    """
-    Load lightcurve sequences from the PRIMVS catalog via PrimvsCatalog.
-
-    Args:
-        source_ids: list/array of VIRAC source IDs.
-        data_dir: path to the PRIMVS lightcurve data directory.
-        lc_size: minimum number of datapoints required per lightcurve.
-        spatial_size: H and W of the output 2D representation (must be divisible by 16).
-        band: photometric band to use (default 'Ks').
-
-    Returns:
-        list of numpy arrays, each shaped (3, spatial_size, spatial_size).
-        Channels are [mag, err, phase] where phase = (mjd - mjd_min) / (mjd_max - mjd_min).
-    """
-    cat = PrimvsCatalog(data_dir)
-    results = cat.get_lightcurves(source_ids)
-
-    sequences = []
-    for source_id, df in tqdm(results.items(), desc='Loading PRIMVS lightcurves'):
-        # Filter to requested band
-        subset = df[df['filter'] == band].dropna(subset=['mag', 'err']).copy()
-        if len(subset) < 2:
-            continue
-
-        mjd = subset['mjd'].values.astype(float)
-        mag = subset['mag'].values.astype(float)
-        err = subset['err'].values.astype(float)
-
-        # Sort by time
-        order = np.argsort(mjd)
-        mjd, mag, err = mjd[order], mag[order], err[order]
-
-        # Skip if not enough points
-        if len(mag) < lc_size:
-            continue
-
-        # Trim to lc_size by randomly removing excess points
-        if len(mag) > lc_size:
-            mjd, mag, err = _delete_rand_items_3col(mjd, mag, err, len(mag) - lc_size)
-
-        # Skip any NaN sequences
-        if np.any(np.isnan(mag)) or np.any(np.isnan(err)) or np.any(np.isnan(mjd)):
-            continue
-
-        # Compute phase from MJD
-        mjd_range = mjd.max() - mjd.min()
-        if mjd_range == 0:
-            continue
-        phase = (mjd - mjd.min()) / mjd_range
-
-        # Tile each channel into a (spatial_size, spatial_size) 2D array
-        sequence = np.stack((
-            tile_to_square(mag, spatial_size),
-            tile_to_square(err, spatial_size),
-            tile_to_square(phase, spatial_size),
-        ), axis=0)
-
-        sequences.append(sequence)
-
-    print(f"Loaded {len(sequences)} valid sequences from PRIMVS catalog")
-    return sequences
 
 
 # --------------------------------------------------------------------------- #
@@ -332,10 +263,6 @@ class LinearAttention(nn.Module):
 class Unet(nn.Module):
     """
     U-Net that predicts the vector field v_θ(z, τ).
-
-    Takes (z, τ) and outputs a vector field of the same spatial shape as z.
-    τ is embedded via sinusoidal positional encoding (scaled to [0, 1000]
-    for comparable frequency range to DDPM integer timesteps).
     """
 
     def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=12, channels=3):
@@ -386,14 +313,6 @@ class Unet(nn.Module):
         )
 
     def forward(self, x, tau):
-        """
-        Args:
-            x: (B, C, H, W) spatial state z
-            tau: (B,) pseudo-time in [0, 1]
-        Returns:
-            (B, C, H, W) predicted vector field for z
-        """
-        # Scale tau to [0, 1000] for sinusoidal embedding frequency range
         t = self.mlp(self.time_pos_emb(tau * 1000.0))
         h = []
 
@@ -425,31 +344,6 @@ class Unet(nn.Module):
 class StableFlowMatching(nn.Module):
     """
     Stable Autonomous Flow Matching (Sprague et al., 2024).
-
-    Replaces GaussianDiffusion (DDPM). Uses the scalar stable CCNF
-    (Definition 4.9) with the unnormalized auto CFM loss L'_Auto
-    (Definition 4.6).
-
-    Key parameters:
-        lambda_z:  Eigenvalue for spatial state. Controls pull toward data.
-        lambda_tau: Eigenvalue for pseudo-time. Controls τ convergence rate.
-        lambda_z / lambda_tau: Controls interpolation curvature (Figure 3).
-            = 1.0 → recovers OT-FM (Corollary 4.12)
-            > 1.0 → z converges faster than τ (sharper transition)
-
-    Training:
-        Sample τ ~ U[0,1], z₀ ~ N(0,I), z₁ from data.
-        Interpolant (Lemma 4.11):
-            z_τ = z₁ + (1-τ)^(λ_z/λ_τ) · (z₀ - z₁)
-        Target vector field (Lemma 4.10):
-            v'_z(z_τ | z₁) = -λ_z · (z_τ - z₁)
-        Loss:
-            ||v_θ(z_τ, τ) - v'_z||²
-
-    Sampling:
-        Integrate ODE from (z ~ N(0,I), τ=0):
-            dz/dt = v_θ(z, τ)
-            dτ/dt = λ_τ · (1 - τ)    [analytical: τ(t) = 1 - exp(-λ_τ·t)]
     """
 
     def __init__(
@@ -469,137 +363,67 @@ class StableFlowMatching(nn.Module):
         self.channels = channels
         self.lambda_z = lambda_z
         self.lambda_tau = lambda_tau
-        self.ratio = lambda_z / lambda_tau  # λ_z / λ_τ
+        self.ratio = lambda_z / lambda_tau
         self.num_sample_steps = num_sample_steps
         self.loss_type = loss_type
 
     def interpolate(self, z1, tau):
-        """
-        Sample from the scalar stable CCNF conditional PDF (Lemma 4.11).
-
-        Given clean data z₁ (= z') and pseudo-time τ, produce:
-            z_τ = z₁ + (1-τ)^(λ_z/λ_τ) · (z₀ - z₁)
-        where z₀ ~ N(0, I).
-
-        Args:
-            z1: (B, C, H, W) clean data samples
-            tau: (B,) pseudo-time values in [0, 1]
-        Returns:
-            z_tau: (B, C, H, W) interpolated noisy samples
-            z0: (B, C, H, W) the sampled noise
-        """
         z0 = torch.randn_like(z1)
-        # alpha = (1 - τ)^(λ_z/λ_τ) — Eq. 35 with τ0=0, τ1=1
         alpha = (1.0 - tau).pow(self.ratio).view(-1, 1, 1, 1)
         z_tau = z1 + alpha * (z0 - z1)
         return z_tau, z0
 
     def target_vector_field(self, z_tau, z1):
-        """
-        Target CCNF vector field for z (Lemma 4.10, Eq. 29):
-            v'_z(z_τ | z₁) = -λ_z · (z_τ - z₁)
-
-        This is the gradient of H'(z|z') = ½λ_z·||z - z'||² (Def 4.8).
-        """
         return -self.lambda_z * (z_tau - z1)
 
     def forward(self, z1):
-        """
-        Compute the unnormalized auto CFM loss L'_Auto (Definition 4.6).
-
-        Args:
-            z1: (B, C, H, W) batch of clean data
-        Returns:
-            loss: scalar
-        """
         b = z1.shape[0]
         device = z1.device
-
-        # Sample τ ~ U[0, 1]
         tau = torch.rand(b, device=device)
-
-        # Get interpolated sample and target
         z_tau, _ = self.interpolate(z1, tau)
         target = self.target_vector_field(z_tau, z1)
-
-        # Predict vector field
         predicted = self.vector_field_fn(z_tau, tau)
-
-        # Loss
         if self.loss_type == "l1":
             loss = (predicted - target).abs().mean()
         elif self.loss_type == "l2":
             loss = F.mse_loss(predicted, target)
         else:
             raise NotImplementedError(f"Unknown loss type: {self.loss_type}")
-
         return loss
 
     @torch.no_grad()
     def sample(self, batch_size=16, num_steps=None):
-        """
-        Generate samples by integrating the learned ODE.
-
-        System (from Section 4.2):
-            dz/dt = v_θ(z, τ)
-            dτ/dt = λ_τ · (1 - τ)
-
-        τ has analytical solution: τ(t) = 1 - exp(-λ_τ · t)
-        We integrate to T = 5/λ_τ so that τ(T) ≈ 0.993.
-
-        Uses Euler integration. For better quality, increase num_steps.
-        """
         num_steps = num_steps or self.num_sample_steps
         device = next(self.vector_field_fn.parameters()).device
-
-        # Initial state: z ~ N(0, I), τ = 0
         S = self.spatial_size
         z = torch.randn(batch_size, self.channels, S, S, device=device)
-
-        # Integration time T s.t. τ(T) ≈ 1
-        # τ(T) = 1 - exp(-λ_τ T), so for τ ≈ 0.993: T = 5/λ_τ
         T = 5.0 / self.lambda_tau
         dt = T / num_steps
-
-        # Use analytical τ trajectory for stability
         t_values = torch.linspace(0, T, num_steps + 1, device=device)
         tau_values = 1.0 - torch.exp(-self.lambda_tau * t_values)
-
         for i in tqdm(range(num_steps), desc="sampling", total=num_steps):
             tau = tau_values[i].expand(batch_size)
             v_z = self.vector_field_fn(z, tau)
             z = z + v_z * dt
-
         return z
 
     @torch.no_grad()
     def sample_midpoint(self, batch_size=16, num_steps=None):
-        """
-        Generate samples using midpoint (RK2) integration for better accuracy.
-        """
         num_steps = num_steps or self.num_sample_steps
         device = next(self.vector_field_fn.parameters()).device
-
         S = self.spatial_size
         z = torch.randn(batch_size, self.channels, S, S, device=device)
-
         T = 5.0 / self.lambda_tau
         dt = T / num_steps
         t_values = torch.linspace(0, T, num_steps + 1, device=device)
         tau_values = 1.0 - torch.exp(-self.lambda_tau * t_values)
-
         for i in tqdm(range(num_steps), desc="sampling (midpoint)", total=num_steps):
             tau_i = tau_values[i].expand(batch_size)
             tau_mid = (0.5 * (tau_values[i] + tau_values[i + 1])).expand(batch_size)
-
-            # Half Euler step
             v1 = self.vector_field_fn(z, tau_i)
             z_mid = z + v1 * (dt / 2.0)
-
-            # Full step using midpoint velocity
             v2 = self.vector_field_fn(z_mid, tau_mid)
             z = z + v2 * dt
-
         return z
 
 
