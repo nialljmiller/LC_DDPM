@@ -65,32 +65,72 @@ def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 
-def _delete_rand_items_3col(arr1, arr2, arr3, n):
-    """Randomly remove n items from three aligned arrays."""
-    indices = random.sample(range(len(arr1)), n)
-    mask = np.ones(len(arr1), dtype=bool)
-    mask[indices] = False
-    return arr1[mask], arr2[mask], arr3[mask]
+def _delete_rand_items_3col(a, b, c, n):
+    keep = np.sort(np.random.choice(len(a), len(a) - n, replace=False))
+    return a[keep], b[keep], c[keep]
 
 
-def tile_to_square(arr, size):
+def tile_to_square(arr, spatial_size):
+    n = spatial_size * spatial_size
+    reps = math.ceil(n / len(arr))
+    return np.tile(arr, reps)[:n].reshape(spatial_size, spatial_size)
+
+
+class LazyPrimvsDataset(data.Dataset):
     """
-    Tile a 1D array into a (size, size) 2D array.
-
-    The array is repeated as many times as needed to fill size*size elements,
-    then reshaped. This gives the UNet a spatially consistent input.
-
-    Args:
-        arr: 1D numpy array
-        size: target spatial dimension (both H and W)
-    Returns:
-        (size, size) numpy array
+    Reads each CSV from disk on demand in __getitem__.
+    RAM usage is O(batch_size), not O(dataset_size).
     """
-    total = size * size
-    reps = int(np.ceil(total / len(arr)))
-    tiled = np.tile(arr, reps)[:total]
-    return tiled.reshape(size, size)
+    def __init__(self, source_ids, data_dir, lc_size=70, spatial_size=128, band="Ks"):
+        super().__init__()
+        from primvs_api import PrimvsCatalog
+        self.cat = PrimvsCatalog(data_dir)
+        self.lc_size = lc_size
+        self.spatial_size = spatial_size
+        self.band = band
+        # Only keep IDs whose CSV exists on disk — checked once at startup.
+        self.source_ids = [int(sid) for sid in source_ids if self.cat.source_exists(sid)]
+        print(f"LazyPrimvsDataset: {len(self.source_ids)} sources on disk "
+              f"(band={band}, lc_size={lc_size}, spatial={spatial_size}x{spatial_size})")
 
+    def __len__(self):
+        return len(self.source_ids)
+
+    def _process(self, sid):
+        df = self.cat.get_lightcurve(sid)
+        if df is None:
+            return None
+        subset = df[df["filter"] == self.band].dropna(subset=["mag", "err"]).copy()
+        if len(subset) < self.lc_size:
+            return None
+        mjd = subset["mjd"].values.astype(np.float32)
+        mag = subset["mag"].values.astype(np.float32)
+        err = subset["err"].values.astype(np.float32)
+        order = np.argsort(mjd)
+        mjd, mag, err = mjd[order], mag[order], err[order]
+        if len(mag) > self.lc_size:
+            mjd, mag, err = _delete_rand_items_3col(mjd, mag, err, len(mag) - self.lc_size)
+        if np.any(np.isnan(mag)) or np.any(np.isnan(err)):
+            return None
+        mjd_range = mjd.max() - mjd.min()
+        if mjd_range == 0:
+            return None
+        phase = (mjd - mjd.min()) / mjd_range
+        s = self.spatial_size
+        seq = np.stack([
+            tile_to_square(mag, s),
+            tile_to_square(err, s),
+            tile_to_square(phase, s),
+        ], axis=0).astype(np.float32)
+        return seq
+
+    def __getitem__(self, index):
+        seq = self._process(self.source_ids[index])
+        if seq is None:
+            seq = self._process(self.source_ids[(index + 1) % len(self.source_ids)])
+        if seq is None:
+            seq = np.zeros((3, self.spatial_size, self.spatial_size), dtype=np.float32)
+        return torch.from_numpy(seq)
 
 # --------------------------------------------------------------------------- #
 #  PRIMVS data loading                                                         #
