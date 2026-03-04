@@ -2,7 +2,7 @@ import argparse
 import torch
 
 from stable_flow_matching import (
-    Unet, StableFlowMatching, Trainer, LightcurveDataset,
+    Unet, StableFlowMatching, Trainer, LazyPrimvsDataset, 
     load_sequences_from_primvs,
 )
 
@@ -58,8 +58,18 @@ def main():
         source_ids, args.data_dir, LC_SIZE,
         spatial_size=SPATIAL_SIZE, band=args.band,
     )
-    dataset = LightcurveDataset(sequences)
-
+    
+    from astropy.table import Table
+    tbl = Table.read(args.fits_file, hdu=1)
+    source_ids = tbl[args.fits_id_column].data
+    
+    dataset = LazyPrimvsDataset(
+        source_ids,
+        data_dir=args.data_dir,
+        lc_size=LC_SIZE,
+        spatial_size=SPATIAL_SIZE,
+        band=args.band,
+    )
     # ---- Model -------------------------------------------------------------
     model = Unet(dim=64, dim_mults=(1, 2, 4, 8), channels=CHANNELS).to(DEVICE)
 
