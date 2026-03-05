@@ -62,7 +62,7 @@ def main():
     )
 
     # ---- Model -------------------------------------------------------------
-    model = Unet(dim=64, dim_mults=(1, 2, 4, 8), channels=CHANNELS).to(DEVICE)
+    model = Unet(dim=64, dim_mults=(1, 2, 4, 8), channels=CHANNELS, groups=8).to(DEVICE)
 
     flow = StableFlowMatching(
         model,
