@@ -33,6 +33,8 @@ def main():
                         help="ODE integration steps during sampling")
     parser.add_argument("--loss_type", default="l2", choices=["l1", "l2"],
                         help="Loss function type")
+    parser.add_argument("--grad_clip_norm", default=1.0, type=float,
+                        help="Clip gradient norm (<=0 disables clipping)")
     args = parser.parse_args()
 
     print(f"Config: λ_z={args.lambda_z}, λ_τ={args.lambda_tau}, "
@@ -87,6 +89,7 @@ def main():
         ema_decay=0.995,
         num_workers=32,
         rank=list(range(torch.cuda.device_count())),
+        grad_clip_norm=args.grad_clip_norm,
     )
 
     if args.milestone != 0:

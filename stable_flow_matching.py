@@ -99,21 +99,41 @@ class LazyPrimvsDataset(data.Dataset):
         if df is None:
             return None
         subset = df[df["filter"] == self.band].dropna(subset=["mag", "err"]).copy()
-        if len(subset) < self.lc_size:
-            return None
         mjd = subset["mjd"].values.astype(np.float32)
         mag = subset["mag"].values.astype(np.float32)
         err = subset["err"].values.astype(np.float32)
+
+        finite = np.isfinite(mjd) & np.isfinite(mag) & np.isfinite(err)
+        positive_err = err > 0
+        keep = finite & positive_err
+        if keep.sum() < self.lc_size:
+            return None
+        mjd, mag, err = mjd[keep], mag[keep], err[keep]
+
         order = np.argsort(mjd)
         mjd, mag, err = mjd[order], mag[order], err[order]
         if len(mag) > self.lc_size:
             mjd, mag, err = _delete_rand_items_3col(mjd, mag, err, len(mag) - self.lc_size)
-        if np.any(np.isnan(mag)) or np.any(np.isnan(err)):
+
+        # Robust normalization keeps values in a stable dynamic range.
+        mag_median = np.median(mag)
+        mag_scale = np.median(np.abs(mag - mag_median)) * 1.4826
+        if not np.isfinite(mag_scale) or mag_scale < 1e-3:
+            mag_scale = np.std(mag)
+        if not np.isfinite(mag_scale) or mag_scale < 1e-3:
             return None
+
+        mag = np.clip((mag - mag_median) / (mag_scale + 1e-6), -8.0, 8.0)
+        err = np.clip(err / (mag_scale + 1e-6), 0.0, 4.0)
+
         mjd_range = mjd.max() - mjd.min()
         if mjd_range == 0:
             return None
         phase = (mjd - mjd.min()) / mjd_range
+
+        if not (np.all(np.isfinite(mag)) and np.all(np.isfinite(err)) and np.all(np.isfinite(phase))):
+            return None
+
         s = self.spatial_size
         seq = np.stack([
             tile_to_square(mag, s),
@@ -467,6 +487,7 @@ class Trainer:
         num_workers=8,
         save_every=5000,
         sample_every=5000,
+        grad_clip_norm=1.0,
         logdir="./logs",
     ):
         super().__init__()
@@ -479,6 +500,7 @@ class Trainer:
         self.step_start_ema = step_start_ema
         self.save_every = save_every
         self.sample_every = sample_every
+        self.grad_clip_norm = grad_clip_norm
 
         self.batch_size = train_batch_size
         self.spatial_size = spatial_size
@@ -539,26 +561,33 @@ class Trainer:
                 t1 = time()
                 with open(str(self.logdir / "loss.txt"), "a") as f:
                     f.write(f"{self.step},{loss.item()}\n")
+                if not torch.isfinite(loss):
+                    print(f"WARNING: non-finite loss at step {self.step}; skipping optimizer update")
+                    self.opt.zero_grad(set_to_none=True)
+                    break
                 (loss / self.gradient_accumulate_every).backward()
+            else:
+                if self.grad_clip_norm is not None and self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
 
-            self.opt.step()
-            self.opt.zero_grad()
+                self.opt.step()
+                self.opt.zero_grad()
 
-            if self.step % self.update_ema_every == 0:
-                self.step_ema()
+                if self.step % self.update_ema_every == 0:
+                    self.step_ema()
 
-            if self.step % self.sample_every == 0:
-                batches = num_to_groups(18, self.batch_size)
-                all_images_list = [
-                    self.ema_model.module.sample(batch_size=n) for n in batches
-                ]
-                all_images = torch.cat(all_images_list, dim=0)
-                all_images = torch.flip(all_images, dims=[1])
-                all_images = [(x - x.min()) / (x.max() - x.min() + 1e-8) for x in all_images]
-                utils.save_image(all_images, str(self.logdir / f"{self.step:08d}-sample.jpg"), nrow=6)
+                if self.step % self.sample_every == 0:
+                    batches = num_to_groups(18, self.batch_size)
+                    all_images_list = [
+                        self.ema_model.module.sample(batch_size=n) for n in batches
+                    ]
+                    all_images = torch.cat(all_images_list, dim=0)
+                    all_images = torch.flip(all_images, dims=[1])
+                    all_images = [(x - x.min()) / (x.max() - x.min() + 1e-8) for x in all_images]
+                    utils.save_image(all_images, str(self.logdir / f"{self.step:08d}-sample.jpg"), nrow=6)
 
-            if self.step != 0 and self.step % self.save_every == 0:
-                self.save(self.step)
+                if self.step != 0 and self.step % self.save_every == 0:
+                    self.save(self.step)
 
             self.step += 1
 
