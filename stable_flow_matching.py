@@ -333,7 +333,7 @@ class Unet(nn.Module):
         dim,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        groups=12,
+        groups=16,
         channels=3,
         num_cond_features=0,
     ):
