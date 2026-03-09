@@ -98,7 +98,7 @@ def main():
         dataset,
         logdir="./logs/",
         spatial_size=SPATIAL_SIZE,
-        train_batch_size=56,
+        train_batch_size=512,
         train_lr=2e-5,
         train_num_steps=750001,
         gradient_accumulate_every=2,
