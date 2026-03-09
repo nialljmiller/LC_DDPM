@@ -333,7 +333,7 @@ class Unet(nn.Module):
         dim,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        groups=16,
+        groups=12,
         channels=3,
         num_cond_features=0,
     ):
@@ -796,6 +796,7 @@ class Trainer:
                     f.write(f"{self.step},{loss.item()}\n")
                 (loss / self.gradient_accumulate_every).backward()
 
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.opt.step()
             self.opt.zero_grad()
 
