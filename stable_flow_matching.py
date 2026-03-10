@@ -634,8 +634,26 @@ class LazyPrimvsDataset(data.Dataset):
         rng = mjd.max() - mjd.min()
         if rng == 0:
             return None
-        phase = (mjd - mjd.min()) / rng
-        s     = self.spatial_size
+
+        # ---- Normalise so every channel is ~ N(0,1) -----------------------
+        # Flow matching interpolates between N(0,1) noise and data;
+        # raw magnitudes (~10-20) cause catastrophic scale mismatch.
+        mag_mean = mag.mean()
+        mag_std  = mag.std()
+        if mag_std < 1e-6:
+            return None                       # constant light curve, skip
+        mag = (mag - mag_mean) / mag_std      # zero mean, unit variance
+        err = err / mag_std                   # keep relative to mag scale
+
+        phase = (mjd - mjd.min()) / rng       # [0, 1]
+        phase = phase * 2.0 - 1.0             # centre to [-1, 1]
+
+        # Clamp to reject extreme outliers (>5σ after normalisation)
+        mag   = np.clip(mag,   -5.0, 5.0)
+        err   = np.clip(err,    0.0, 5.0)
+        phase = np.clip(phase, -1.0, 1.0)
+
+        s = self.spatial_size
         return np.stack([
             tile_to_square(mag,   s),
             tile_to_square(err,   s),
@@ -783,18 +801,31 @@ class Trainer:
 
         t1 = time()
         while self.step < self.train_num_steps:
+            bad_batch = False
             for _ in range(self.gradient_accumulate_every):
                 lc, cond = next(self.dl)
                 lc       = lc.to(device=DEVICE, dtype=torch.float)
                 cond     = self._to_cond(cond)
 
                 loss = self.model(lc, cond).sum()
+
+                # ---- NaN / Inf guard: skip this entire optimizer step ------
+                if not torch.isfinite(loss):
+                    print(f"{self.step}: *** NaN/Inf loss — skipping batch ***")
+                    bad_batch = True
+                    break
+
                 t0   = time()
                 print(f"{self.step}: {loss.item():.6f}  Δt: {t0 - t1:.3f}s")
                 t1   = time()
                 with open(str(self.logdir / "loss.txt"), "a") as f:
                     f.write(f"{self.step},{loss.item()}\n")
                 (loss / self.gradient_accumulate_every).backward()
+
+            if bad_batch:
+                self.opt.zero_grad()          # discard any partial grads
+                self.step += 1
+                continue
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.opt.step()
