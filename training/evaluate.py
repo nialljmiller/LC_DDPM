@@ -179,7 +179,12 @@ def cmd_period(a):
 
 # ---------------------------------------------------------------- (c) real vs synthetic classifier
 def load_shard(shards, name, split, n, rng):
-    d = np.load(Path(shards) / f"{name}.npz")
+    npyd = Path(shards) / f"{name}.npyd"  # unpacked arrays: memory-mapped, read once
+    if npyd.is_dir():
+        d = {k: np.load(npyd / f"{k}.npy", mmap_mode="r") for k in ("time", "mag", "err", "offsets")}
+    else:  # NpzFile re-reads an array on every access, so load each one once
+        with np.load(Path(shards) / f"{name}.npz") as z:
+            d = {k: z[k] for k in ("time", "mag", "err", "offsets")}
     meta = json.loads((Path(shards) / f"{name}_meta.json").read_text())
     labels = [r for r in json.loads((Path(shards) / f"{name}_labels.json").read_text())
               if meta[r["index"]]["split"] == split]
