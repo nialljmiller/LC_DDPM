@@ -82,3 +82,28 @@ training.
 
 Each catalogue's own period convention is kept (OGLE/Kepler/TESS eclipsing binaries:
 orbital period). It is recorded per star through `shard`; no convention is imposed.
+
+## Bank v2 additions (2026-11-17)
+
+Written to a NEW directory (`/net/scratch/nillmill/lcddpm/bank_v2/`); bank v1 stays untouched
+because finished runs link to it.
+
+- `templates.npz` gains `resid` (float32, concatenated, aligned with `time`): the template star's
+  residuals, mag minus its fitted profile at its label period (labelled stars) or minus its median
+  (quiet stars). `scatter` becomes robust: 1.4826 * MAD(resid) / median(err). The old rms-based
+  value is kept as `scatter_rms`.
+- `profiles.npz` gains `repeats` (int8): estimated number of cycles of the profile per label period
+  (1 = normal; >= 2 suggests the label is a multiple of the true period). Training drops
+  `repeats >= 3` by default.
+- Thin binned regime (8-32 points per bin): binned-median and Fourier profiles are both computed and
+  the one with lower BIC is kept.
+- `vvv_asassn` classes come from PRIMVS_P_ASASSN.fits `variable_type` (copy:
+  `/net/scratch/nillmill/lcddpm/vvv_asassn_classes.json`, VIRAC sourceid -> ASAS-SN class string,
+  e.g. "ROT:", "RRAB", "EA"), mapped through the existing class map.
+
+## Renderer noise (v2)
+
+`noise="residual"` (default when the template has `resid`): the template star's real residual series,
+circularly shifted by a random index and randomly sign-flipped, is added to the model curve. This keeps
+real outliers, correlated noise and systematics. `noise="gaussian"`: N(0, (err * scatter)^2) with the
+robust scatter. With user-supplied `times`, residual noise is not aligned, so Gaussian is used.
