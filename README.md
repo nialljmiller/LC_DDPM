@@ -1,113 +1,92 @@
+# LC_DDPM
 
-# LC_DDPM (Light Curve Denoising Diffusion Probabilistic Models)
+Conditional denoising diffusion models that generate realistic variable-star light curves.
 
-This repository contains a PyTorch implementation of **Denoising Diffusion Probabilistic Models (DDPM)** specifically adapted for generating synthetic astronomical light curves. The model uses a UNet architecture to learn the distribution of periodic variable light curves and generate new, realistic samples.
+Ask for a star by survey, period, amplitude and (optionally) mean magnitude and class, and get back
+a light curve on a real survey cadence with realistic errors:
 
-## Features
+```python
+from lc_ddpm import generate
 
-* **Custom Diffusion Model:** Implementation of Gaussian Diffusion adapted for 1D/sequential light curve data using 2D convolutions (treating time/phase series similarly to image channels/dimensions).
-* **Stochastic Data Loading:** Includes a custom `StochasticCurves` dataset loader designed to handle light curve CSVs, including magnitude, error, phase, and time.
-* **HPC Ready:** Includes scripts (`DDPM.sh`) for submitting training jobs to PBS/Torque-based GPU clusters.
-* **Inference Pipeline:** Scripts to generate (sample) new light curves from trained model checkpoints.
-
-## File Structure
-
-* `denoising_diffusion_pytorch.py`: The core library containing the `Unet` architecture, `GaussianDiffusion` logic, `Trainer` class, and data loading utilities (`Lightcurves`, `StochasticCurves`).
-* `train.py`: The entry point for training the model.
-* `infer.py`: The entry point for generating (sampling) data using a trained checkpoint.
-* `DDPM.sh`: A PBS shell script for submitting training jobs to a GPU cluster.
-
-## Requirements
-
-To run this code, you will need the following Python libraries:
-
-```txt
-torch
-numpy
-astropy
-tqdm
-einops
-torchvision
-
+curves = generate(survey="VVV-Ks", period=0.55, amplitude=0.4, mag=15.0, cls="RR", n=10, seed=1)
+c = curves[0]
+c["time"], c["mag"], c["err"]        # observation times (days), magnitudes, errors
+c["period"], c["amplitude"]          # exactly what was requested
 ```
-
-## Configuration (Important)
-
-**Note on Data Paths:**
-The scripts currently contain hardcoded absolute paths specific to the original training environment (e.g., `/beegfs/car/njm/...`). Before running, you **must** update these paths to point to your local data directories.
-
-1. **In `denoising_diffusion_pytorch.py**`:
-* Update the `sequences_pickle` path in the `Trainer.__init__` method.
-* Update the `tier` variable (glob pattern) to point to your CSV files.
-
-
-2. **In `train.py**`:
-* Update the path in the `Trainer` initialization: `'/beegfs/car/njm/Periodic_Variables/LC/'`.
-
-
-3. **In `DDPM.sh**`:
-* Update the python execution path if not running on the specific cluster originally designed for.
-
-
-
-## Usage
-
-### 1. Data Preparation
-
-The model expects data in CSV format. The `StochasticCurves` class reads files expecting columns for Magnitude, Error, Phase, and Time. Ensure your data matches the format expected by the `np.genfromtxt` call in `denoising_diffusion_pytorch.py`.
-
-### 2. Training
-
-To train the model, run `train.py`. You can specify a milestone (checkpoint step) if resuming training.
 
 ```bash
-# Start from scratch
-python train.py
-
-# Resume from a specific checkpoint (e.g., step 177000)
-python train.py --milestone 177000
-
+lc-ddpm generate --survey VVV-Ks --period 0.55 --amplitude 0.4 --mag 15 --cls RR -n 10 --out rr.csv --plot rr.png
+lc-ddpm info          # surveys, classes and the model card
 ```
 
-**Training Parameters:**
-You can adjust hyperparameters inside `train.py`:
+> **Status (November 2026):** v2.0 is a complete rewrite. Trained weights are not yet published;
+> until they are, train a model with `training/train.py` (below) and point `--model` /
+> `Generator.from_pretrained()` at it, or set `LC_DDPM_HOME`.
 
-* `lc_size`: Length of the light curve sequence.
-* `train_batch_size`: Batch size.
-* `train_lr`: Learning rate.
-* `train_num_steps`: Total training steps.
+## How it works
 
-### 3. Inference (Generation)
+1. **Shape (the diffusion model).** A 1-D U-Net with circular padding generates the phase-folded
+   light-curve shape: 128 phase points in units of the amplitude, faintest point at phase 0.
+   It is a v-prediction DDPM (cosine schedule) sampled with DDIM and classifier-free guidance.
+   Every condition (survey, class, log period, log amplitude, magnitude) is dropped at random
+   during training, so any subset of them can be given at generation time.
+2. **Cadence and noise (real template stars).** The shape is placed on the observation times and
+   per-point errors of a real star from the requested survey, chosen among the stars closest in
+   magnitude. Noise is Gaussian with that star's errors, scaled by its measured excess scatter.
+3. **Assembly.** `mag(t) = mean_mag + amplitude * (P(((t - t0) / period) mod 1) - mean(P)) + noise`.
+   Period and amplitude are therefore exact by construction, which makes the output usable as
+   labelled training data for period-finding methods.
 
-To generate synthetic light curves using a trained model, use `infer.py`.
+You can also pass your own observation times (`times=`), in which case errors are drawn from the
+template star's error distribution.
+
+## Surveys and training data
+
+The model is trained on phase-folded profiles of catalogued periodic variables from the training
+split of the [NN_Periodogram](https://github.com/nialljmiller/NN_Periodogram) data set:
+
+| Survey token | Source | Band | Absolute magnitudes |
+|---|---|---|---|
+| `OGLE-I` | OGLE-IV Bulge, disk, LMC and SMC variables | I | yes |
+| `VVV-Ks` | VVV / PRIMVS variables | Ks | yes |
+| `ASAS-SN-V`, `ASAS-SN-g` | ASAS-SN light curves of VSX variables | V, g | no (relative) |
+| `Kepler-Kp` | Kepler eclipsing binaries | Kp | no (relative) |
+| `TESS-T` | TESS eclipsing binaries | T | no (relative) |
+
+For surveys without absolute magnitudes the generated curves are in relative magnitudes (mean 0).
+Periods follow each catalogue's own convention (eclipsing binaries: orbital period).
+Only stars whose every entry is in the NN_Periodogram training split are used, so synthetic curves
+never carry information about NN_Periodogram's validation or test stars.
+
+## Installation
 
 ```bash
-python infer.py --dataset probes --milestone 750000 --batches 10
-
+pip install -e .            # core: numpy + torch
+pip install -e ".[plot]"    # adds matplotlib for --plot
 ```
 
-**Arguments:**
-
-* `--dataset`: Choices are `probes` or `sdss`. (Ensure you configure the paths for these choices inside `infer.py`).
-* `--milestone`: The training step number of the model checkpoint you wish to load.
-* `--batches`: The number of batches to generate.
-
-Output files are saved as `.npy` files in the `inferred/` directory.
-
-### 4. HPC Submission
-
-If you are using a cluster with a PBS scheduler, you can submit the job using the provided shell script:
+## Training your own model
 
 ```bash
-qsub DDPM.sh
+# 1. Build the profile and template bank from NN_Periodogram shards
+python training/build_bank.py --help
 
+# 2. Train (single GPU; bf16 on CUDA)
+python training/train.py --bank BANK_DIR --out RUN_DIR
+
+# 3. Evaluate: sample grids, period/amplitude recovery, real-vs-synthetic classifier
+python training/evaluate.py --help
 ```
 
-## Model Architecture
+`RUN_DIR/lc_ddpm.pt` together with `templates.npz` is everything `Generator.from_pretrained(RUN_DIR)`
+needs. The design and file formats are documented in [docs/DESIGN.md](docs/DESIGN.md).
 
-The model utilizes a UNet with:
+## History
 
-* Sinusoidal Positional Embeddings.
-* ResNet blocks with Mish activation.
-* Linear Attention mechanisms in the bottleneck and up/down-sampling blocks.
-* Gaussian Diffusion process with a cosine beta schedule.
+Versions before 2.0 (2025 to early 2026) tiled light curves into 2-D images and trained a 2-D
+U-Net (DDPM, later stable flow matching) on PRIMVS light curves. That code is in the git history
+(last commit `263dad6`).
+
+## Citation and licence
+
+See [CITATION.cff](CITATION.cff). MIT licence, copyright Niall Miller.

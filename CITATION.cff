@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use LC_DDPM, please cite it as below."
+title: "LC_DDPM: conditional diffusion models for realistic variable-star light curves"
+type: software
+authors:
+  - family-names: Miller
+    given-names: Niall J.
+version: 2.0.0
+date-released: 2026-11-17
+license: MIT
+repository-code: "https://github.com/nialljmiller/LC_DDPM"
+keywords:
+  - astronomy
+  - variable stars
+  - light curves
+  - diffusion models
+  - synthetic data
