@@ -52,7 +52,15 @@ def best_period(t, m, e, fmax, oversample=5, method="ls"):
         from nn_periodogram import periodogram
         return float(periodogram(t, m, e).best_period)
     T = t.max() - t.min()
-    freqs = np.arange(1 / T, fmax, 1 / (oversample * T))
+    df = 1 / (oversample * T)
+    if method == "ls":
+        try:
+            import nifty_ls  # fast (NUFFT) Lomb-Scargle, same answer as the numpy fallback below
+            r = nifty_ls.lombscargle(t, m, e, fmin=1 / T, fmax=fmax, Nf=int((fmax - 1 / T) / df) + 1)
+            return 1 / r.freq()[np.argmax(r.power)]
+        except ImportError:
+            pass
+    freqs = np.arange(1 / T, fmax, df)
     return 1 / freqs[np.argmax(lomb_scargle(t, m, e, freqs))]
 
 
