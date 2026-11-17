@@ -8,7 +8,7 @@ import torch
 from .data import encode_conditions
 from .diffusion import Diffusion
 from .model import UNet1D
-from .render import TemplateBank, normalise_profiles, render
+from .render import TemplateBank, noise_mode, normalise_profiles, render
 
 CHECKPOINT_NAME, TEMPLATES_NAME = "lc_ddpm.pt", "templates.npz"
 # Placeholder: download location of the released weights + templates. Not published yet.
@@ -91,7 +91,7 @@ class Generator:
         return normalise_profiles(np.concatenate(out))
 
     def generate(self, survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=2.0,
-                 steps=50, noise=True):
+                 steps=50, noise="residual"):
         """Generate ``n`` light curves of one survey.
 
         period (days), amplitude (peak-to-peak mag), mag (mean magnitude): scalars or arrays, broadcast
@@ -100,13 +100,17 @@ class Generator:
         for surveys without absolute magnitudes (ASAS-SN, Kepler, TESS) the mean is 0, i.e. the
         curves are in relative magnitudes. cls=None leaves the class unconditioned.
         times: None (template cadence), one array for all curves, or a list of n arrays.
+        noise: "residual" (default; the template star's real residuals, randomly shifted and sign-flipped),
+        "gaussian" (N(0, (err * scatter)^2)) or None / "none" (noiseless). Residual noise falls back to
+        Gaussian for a v1 template bank (no ``resid``) and for user ``times``.
         Returns a list of dicts {time, mag, err, period, amplitude, mean_mag, survey, cls,
-        template_sourceid, t0, scatter, profile}.
+        template_sourceid, t0, scatter, noise (mode applied), profile}.
         """
         s_idx = _lookup(survey, self.surveys, "survey")
         if s_idx < 0:
             raise ValueError(f"survey is required; valid survey names: {', '.join(self.surveys)}")
         c_idx = _lookup(cls, self.classes, "class")
+        noise_mode(noise)  # fail before sampling on a bad value
         rng = np.random.default_rng(seed)
         n = max(n, *(np.size(v) for v in (period, amplitude, mag) if v is not None))
         period, amplitude = (np.broadcast_to(np.asarray(v, np.float64), (n,)).copy() for v in (period, amplitude))
@@ -130,7 +134,7 @@ _DEFAULT = {}
 
 
 def generate(survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=2.0, steps=50,
-             model=None):
+             model=None, noise="residual"):
     """Module-level shortcut for :meth:`Generator.generate`. ``model`` may be a Generator, a
     checkpoint path or directory, or None (cached default from $LC_DDPM_HOME or ~/.cache/lc_ddpm)."""
     if not isinstance(model, Generator):
@@ -139,4 +143,4 @@ def generate(survey, period, amplitude, mag=None, cls=None, n=1, seed=None, time
             _DEFAULT[key] = Generator.from_pretrained(model)
         model = _DEFAULT[key]
     return model.generate(survey, period, amplitude, mag=mag, cls=cls, n=n, seed=seed, times=times,
-                          guidance=guidance, steps=steps)
+                          guidance=guidance, steps=steps, noise=noise)

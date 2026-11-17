@@ -32,13 +32,19 @@ lc-ddpm info          # surveys, classes and the model card
    during training, so any subset of them can be given at generation time.
 2. **Cadence and noise (real template stars).** The shape is placed on the observation times and
    per-point errors of a real star from the requested survey, chosen among the stars closest in
-   magnitude. Noise is Gaussian with that star's errors, scaled by its measured excess scatter.
+   magnitude. By default (`noise="residual"`) the noise is that star's own residual series (its
+   light curve minus its fitted profile), circularly shifted by a random number of points and
+   randomly sign-flipped, so real outliers, correlated noise and systematics are kept.
+   `noise="gaussian"` draws N(0, (err * scatter)^2) from the star's errors and robust scatter
+   ratio, and `noise=None` (CLI `--noise none`) gives noiseless curves. Template banks without
+   residuals (bank v1) use Gaussian noise.
 3. **Assembly.** `mag(t) = mean_mag + amplitude * (P(((t - t0) / period) mod 1) - mean(P)) + noise`.
    Period and amplitude are therefore exact by construction, which makes the output usable as
    labelled training data for period-finding methods.
 
 You can also pass your own observation times (`times=`), in which case errors are drawn from the
-template star's error distribution.
+template star's error distribution and the noise is Gaussian (residuals cannot be aligned with other
+times). Each returned curve records the noise mode applied under `"noise"`.
 
 ## Surveys and training data
 
@@ -71,10 +77,13 @@ pip install -e ".[plot]"    # adds matplotlib for --plot
 # 1. Build the profile and template bank from NN_Periodogram shards
 python training/build_bank.py --help
 
-# 2. Train (single GPU; bf16 on CUDA)
-python training/train.py --bank BANK_DIR --out RUN_DIR
+# 2. Train (single GPU; bf16 on CUDA). Useful options: --min-snr 5 (drop low-S/N profiles),
+#    --max-repeats 2 (drop labels that look like multiples of the true period), --init CKPT (fine-tune)
+python training/train.py --bank BANK_DIR --out RUN_DIR --min-snr 5
 
-# 3. Evaluate: sample grids, period/amplitude recovery, real-vs-synthetic classifier
+# 3. Evaluate: sample grids (grid), period/amplitude recovery with residual and Gaussian noise
+#    (period), real-vs-synthetic classifier in shape and full-pipeline modes with profile and
+#    summary-statistic features (classifier), guidance / DDIM-step sweep (sweep)
 python training/evaluate.py --help
 ```
 

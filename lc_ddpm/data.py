@@ -45,9 +45,12 @@ def encode_conditions(survey, cls, period, amplitude, mag, norm, device="cpu"):
             "mask": torch.as_tensor(mask, device=device)}
 
 
-def select_rows(arrays, min_snr=None, tiers=None):
-    """Indices of rows passing the snr / tier filters."""
+def select_rows(arrays, min_snr=None, tiers=None, max_repeats=None):
+    """Indices of rows passing the snr / tier / repeats filters. ``max_repeats`` keeps rows with
+    ``repeats <= max_repeats`` and is ignored for a bank without ``repeats`` (bank v1)."""
     keep = np.ones(len(arrays["profile"]), bool)
+    if max_repeats is not None and "repeats" in arrays:
+        keep &= arrays["repeats"] <= max_repeats
     if min_snr is not None:
         keep &= arrays["snr"] >= min_snr
     if tiers is not None:
@@ -67,10 +70,10 @@ class ProfileDataset(Dataset):
     point by convention, so circular rolls or mirroring would change the meaning.
     """
 
-    def __init__(self, bank_dir, min_snr=None, tiers=None, tier_weight=1.0, norm=None, rows=None):
+    def __init__(self, bank_dir, min_snr=None, tiers=None, tier_weight=1.0, norm=None, rows=None, max_repeats=None):
         self.arrays, self.vocab = load_bank(bank_dir)
         self.norm = norm or compute_norm(self.arrays)
-        self.rows = select_rows(self.arrays, min_snr, tiers) if rows is None else np.asarray(rows)
+        self.rows = select_rows(self.arrays, min_snr, tiers, max_repeats) if rows is None else np.asarray(rows)
         a = self.arrays
         self.x = torch.as_tensor(2 * a["profile"][self.rows] - 1, dtype=torch.float32)
         self.cond = encode_conditions(a["survey"][self.rows], a["cls"][self.rows], a["period"][self.rows],

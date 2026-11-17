@@ -2,20 +2,33 @@
 
     python training/evaluate.py grid       --model RUN --bank BANK --out grid.png
     python training/evaluate.py period     --model RUN --bank BANK [--n 200 --method ls|nn]
-    python training/evaluate.py classifier --model RUN --shards SHARD_DIR --shard NAME --survey OGLE-I
+    python training/evaluate.py classifier --model RUN --shards SHARD_DIR --shard NAME --survey OGLE-I [--mode shape|full]
+    python training/evaluate.py sweep      --model RUN --bank BANK --shards SHARD_DIR --shard NAME --survey OGLE-I
 
 grid:       generated profiles vs the real bank profiles nearest in condition space.
 period:     render light curves with bank-like conditions, recover the period with a numpy
             generalised Lomb-Scargle (or nn_periodogram, if installed) and the amplitude from the
-            folded curve; report recovery fractions per survey.
-classifier: real light curves from an NN_Periodogram shard (``NAME.npz``, ``NAME_meta.json``,
-            ``NAME_labels.json``) vs synthetic curves on the same times and errors; a small MLP on
-            folded, binned, normalised profiles; report the held-out AUC (0.5 = indistinguishable).
+            folded curve; report recovery fractions per survey, once with residual noise and once
+            with Gaussian noise (same profiles, templates and phases; only the noise differs).
+classifier: real light curves from an NN_Periodogram shard (``NAME.npyd/`` memory-mapped arrays or
+            ``NAME.npz``, plus ``NAME_meta.json``, ``NAME_labels.json``) vs synthetic curves; a small
+            MLP; held-out AUC (0.5 = indistinguishable), train/test split by star.
+            mode shape: synthetic curves on the real star's own times and errors with white noise at
+            that star's scatter (tests the shape model alone).
+            mode full:  synthetic curves from Generator.generate for the same survey/period/amplitude/mag
+            (template cadence and template noise from the bank, i.e. training-split stars): the
+            realistic pipeline.
+            Feature sets, each reported: profile (folded binned normalised profile at the known period
+            + residual rms / amplitude), stats (cadence-independent statistics, STAT_NAMES), both.
+sweep:      for each guidance and DDIM step count: shape-mode classifier AUC on one shard and the
+            diversity of samples for fixed conditions (mean pairwise rms distance among samples)
+            vs that among the nearest real bank profiles; JSON table.
 
 Requires the package: run `pip install -e .` from the repo root first.
 """
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -64,8 +77,8 @@ def best_period(t, m, e, fmax, oversample=5, method="ls"):
     return 1 / freqs[np.argmax(lomb_scargle(t, m, e, freqs))]
 
 
-def fold_binned(t, m, period, nbins):
-    """Median of each phase bin (empty bins interpolated periodically) and the residual rms."""
+def fold(t, m, period, nbins):
+    """Median of each phase bin (empty bins interpolated periodically) and the residuals around it."""
     ph = np.mod(t / period, 1.0)
     k = np.minimum((ph * nbins).astype(int), nbins - 1)
     prof = np.full(nbins, np.nan)
@@ -74,7 +87,13 @@ def fold_binned(t, m, period, nbins):
     good = np.flatnonzero(np.isfinite(prof))
     x = (np.arange(nbins) + 0.5) / nbins
     prof = np.interp(x, x[good], prof[good], period=1.0)
-    return prof, float(np.std(m - prof[k]))
+    return prof, m - prof[k]
+
+
+def fold_binned(t, m, period, nbins):
+    """Folded binned profile and the residual rms."""
+    prof, r = fold(t, m, period, nbins)
+    return prof, float(np.std(r))
 
 
 def profile_features(t, m, period, nbins):
@@ -84,6 +103,32 @@ def profile_features(t, m, period, nbins):
     amp = prof.max() - prof.min()
     prof = (prof - prof.min()) / max(amp, 1e-12)
     return np.append(np.roll(prof, -int(np.argmax(prof))), rms / max(amp, 1e-12))
+
+
+STAT_NAMES = ("log10_n_points", "log10_span", "skewness", "excess_kurtosis", "eta_resid", "outlier_frac_3sigma",
+              "resid_rms_over_median_err")
+
+
+def stat_features(t, m, e, period, nbins):
+    """Statistics a skeptic would check, none of which uses absolute time or mean magnitude: point count,
+    time span, skewness and excess kurtosis of the magnitudes, von Neumann ratio of the time-ordered
+    residuals around the folded profile, fraction of residuals beyond 3 robust sigma (1.4826 MAD),
+    and residual rms / median error."""
+    o = np.argsort(t)
+    t, m, e = t[o], m[o], e[o]
+    _, r = fold(t, m, period, nbins)
+    z = (m - m.mean()) / max(m.std(), 1e-12)
+    sig = 1.4826 * np.median(np.abs(r - np.median(r)))
+    return np.array([np.log10(len(t)), np.log10(max(t[-1] - t[0], 1e-6)), np.mean(z ** 3), np.mean(z ** 4) - 3,
+                     np.mean(np.diff(r) ** 2) / max(np.var(r), 1e-24),
+                     np.mean(np.abs(r - np.median(r)) > 3 * max(sig, 1e-12)), np.std(r) / max(np.median(e), 1e-12)])
+
+
+def curve_features(curves, nbins):
+    """(profile features, stat features) for a list of (t, m, e, period)."""
+    prof = np.array([profile_features(t, m, p, nbins) for t, m, e, p in curves])
+    stats = np.array([stat_features(t, m, e, p, nbins) for t, m, e, p in curves])
+    return prof, stats
 
 
 def auc(score, label):
@@ -99,9 +144,56 @@ def auc(score, label):
     return float((ranks[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
+def mlp_auc(X, y, test, epochs, seed):
+    """Train a small MLP on the non-test rows (features standardised on them) and return the test AUC."""
+    X = np.nan_to_num(np.asarray(X, np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    mu, sd = X[~test].mean(0), X[~test].std(0)
+    X = torch.tensor((X - mu) / np.where(sd > 0, sd, 1.0), dtype=torch.float32)
+    yt = torch.tensor(y, dtype=torch.float32)
+    torch.manual_seed(seed)
+    net = torch.nn.Sequential(torch.nn.Linear(X.shape[1], 64), torch.nn.ReLU(), torch.nn.Linear(64, 64),
+                              torch.nn.ReLU(), torch.nn.Linear(64, 1))
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    tr = torch.as_tensor(~test)
+    for _ in range(epochs):
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(net(X[tr])[:, 0], yt[tr])
+        opt.zero_grad(); loss.backward(); opt.step()
+    with torch.no_grad():
+        score = net(X[torch.as_tensor(test)])[:, 0].numpy()
+    return auc(score, y[test])
+
+
+def feature_set_aucs(real, fake, test_stars, epochs, seed, sets=("profile", "stats", "both")):
+    """AUC per feature set. real/fake: (profile, stats) feature arrays, row i of both belongs to star i;
+    the same star split (``test_stars``, boolean per star) is used for every set."""
+    y = np.r_[np.zeros(len(real[0])), np.ones(len(fake[0]))]
+    test = np.r_[test_stars, test_stars]
+    cols = {"profile": lambda f: f[0], "stats": lambda f: f[1], "both": lambda f: np.concatenate(f, 1)}
+    return {k: mlp_auc(np.concatenate([cols[k](real), cols[k](fake)]), y, test, epochs, seed) for k in sets}
+
+
 def bank_conditions(arrays, rows, vocab):
     return [(vocab["surveys"][arrays["survey"][r]], vocab["classes"][arrays["cls"][r]], float(arrays["period"][r]),
              float(arrays["amplitude"][r]), float(arrays["mag"][r])) for r in rows]
+
+
+def normalised_conditions(arrays, norm):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        num = np.stack([np.log10(arrays["period"]), np.log10(arrays["amplitude"]), arrays["mag"]], 1)
+    return (num - np.asarray(norm["mean"])) / np.asarray(norm["std"])
+
+
+def nearest_real(arrays, num, r, k):
+    """Indices of the ``k`` bank rows of the same survey and class nearest to row ``r`` in condition space."""
+    same = np.flatnonzero((arrays["survey"] == arrays["survey"][r]) & (arrays["cls"] == arrays["cls"][r]))
+    return same[np.argsort(np.nansum((num[same] - num[r]) ** 2, 1))[:k]]
+
+
+def mean_pairwise_rms(p):
+    """Mean rms distance over all pairs of rows of ``p``."""
+    d = np.sqrt(((p[:, None] - p[None]) ** 2).mean(-1))
+    iu = np.triu_indices(len(p), 1)
+    return float(d[iu].mean()) if len(iu[0]) else float("nan")
 
 
 # ---------------------------------------------------------------- (a) sample grids
@@ -113,16 +205,13 @@ def cmd_grid(a):
     arrays, vocab = load_bank(a.bank)
     rng = np.random.default_rng(a.seed)
     rows = rng.choice(len(arrays["profile"]), a.n_cond, replace=False)
-    num = np.stack([np.log10(arrays["period"]), np.log10(arrays["amplitude"]), arrays["mag"]], 1)
-    num = (num - np.asarray(g.norm["mean"])) / np.asarray(g.norm["std"])
+    num = normalised_conditions(arrays, g.norm)
     cols = 4
     fig, axes = plt.subplots((a.n_cond + cols - 1) // cols, cols, figsize=(4 * cols, 2.8 * ((a.n_cond + cols - 1) // cols)),
                              squeeze=False)
     ph = (np.arange(arrays["profile"].shape[1]) + 0.5) / arrays["profile"].shape[1]
     for ax, r in zip(axes.flat, rows):
-        same = np.flatnonzero((arrays["survey"] == arrays["survey"][r]) & (arrays["cls"] == arrays["cls"][r]))
-        d = np.nansum((num[same] - num[r]) ** 2, 1)
-        real = arrays["profile"][same[np.argsort(d)[:a.k_real]]]
+        real = arrays["profile"][nearest_real(arrays, num, r, a.k_real)]
         n = a.n_samples
         fake = g.sample_profiles(np.full(n, arrays["survey"][r]), np.full(n, arrays["cls"][r]),
                                  np.full(n, arrays["period"][r]), np.full(n, arrays["amplitude"][r]),
@@ -145,41 +234,50 @@ def cmd_period(a):
     g = Generator.from_pretrained(a.model, device=a.device)
     arrays, vocab = load_bank(a.bank)
     rng = np.random.default_rng(a.seed)
+    modes = [m.strip() for m in a.noise.split(",")]
     report = {}
     for s_idx, survey in enumerate(vocab["surveys"]):
         rows = np.flatnonzero(arrays["survey"] == s_idx)
         if len(rows) == 0:
             continue
         rows = rng.choice(rows, min(a.n, len(rows)), replace=False)
-        exact = alias = 0
-        amp_ratio = []
-        for c_idx in np.unique(arrays["cls"][rows]):
-            r = rows[arrays["cls"][rows] == c_idx]
-            curves = g.generate(survey, arrays["period"][r], arrays["amplitude"][r], mag=arrays["mag"][r],
-                                cls=vocab["classes"][c_idx], n=len(r), seed=int(rng.integers(2 ** 31)),
-                                guidance=a.guidance, steps=a.steps)
-            for c in curves:
-                t, m, e = c["time"], c["mag"], c["err"]
-                if len(t) > a.max_points:
-                    keep = np.sort(rng.choice(len(t), a.max_points, replace=False))
-                    t, m, e = t[keep], m[keep], e[keep]
-                ratio = best_period(t, m, e, max(a.fmax, 1.5 / c["period"]), method=a.method) / c["period"]
-                exact += abs(ratio - 1) < a.tol
-                alias += min(abs(ratio - k) / k for k in (0.5, 1, 2)) < a.tol
-                prof, _ = fold_binned(c["time"], c["mag"] - c["mean_mag"], c["period"], a.bins)
-                amp_ratio.append((prof.max() - prof.min()) / c["amplitude"])
-        n = len(rows)
-        report[survey] = {"n": int(n), "period_exact": exact / n, "period_with_aliases": alias / n,
-                          "amplitude_ratio_median": float(np.median(amp_ratio)),
-                          "amplitude_ratio_iqr": [float(q) for q in np.percentile(amp_ratio, [25, 75])]}
-        print(survey, json.dumps(report[survey]), flush=True)
+        groups = [(c_idx, rows[arrays["cls"][rows] == c_idx], int(rng.integers(2 ** 31)))
+                  for c_idx in np.unique(arrays["cls"][rows])]
+        report[survey] = {}
+        for mode in modes:  # same seed per class group: same profiles, templates and t0; only the noise differs
+            exact = alias = 0
+            amp_ratio, applied = [], Counter()
+            for c_idx, r, seed in groups:
+                curves = g.generate(survey, arrays["period"][r], arrays["amplitude"][r], mag=arrays["mag"][r],
+                                    cls=vocab["classes"][c_idx], n=len(r), seed=seed, guidance=a.guidance,
+                                    steps=a.steps, noise=mode)
+                sub = np.random.default_rng(seed)
+                for c in curves:
+                    applied[c["noise"]] += 1
+                    t, m, e = c["time"], c["mag"], c["err"]
+                    if len(t) > a.max_points:
+                        keep = np.sort(sub.choice(len(t), a.max_points, replace=False))
+                        t, m, e = t[keep], m[keep], e[keep]
+                    ratio = best_period(t, m, e, max(a.fmax, 1.5 / c["period"]), method=a.method) / c["period"]
+                    exact += abs(ratio - 1) < a.tol
+                    alias += min(abs(ratio - k) / k for k in (0.5, 1, 2)) < a.tol
+                    prof, _ = fold_binned(c["time"], c["mag"] - c["mean_mag"], c["period"], a.bins)
+                    amp_ratio.append((prof.max() - prof.min()) / c["amplitude"])
+            n = len(rows)
+            report[survey][mode] = {"n": int(n), "noise_applied": dict(applied), "period_exact": exact / n,
+                                    "period_with_aliases": alias / n,
+                                    "amplitude_ratio_median": float(np.median(amp_ratio)),
+                                    "amplitude_ratio_iqr": [float(q) for q in np.percentile(amp_ratio, [25, 75])]}
+            print(survey, mode, json.dumps(report[survey][mode]), flush=True)
     if a.out:
         Path(a.out).write_text(json.dumps(report, indent=1))
 
 
 # ---------------------------------------------------------------- (c) real vs synthetic classifier
-def load_shard(shards, name, split, n, rng):
-    npyd = Path(shards) / f"{name}.npyd"  # unpacked arrays: memory-mapped, read once
+def load_shard(shards, name, split, n, rng, min_points=10):
+    """Up to ``n`` random stars of ``split`` as (t, m, e, period). Arrays come from the memory-mapped
+    ``NAME.npyd/`` directory when present; otherwise each ``NAME.npz`` array is read once."""
+    npyd = Path(shards) / f"{name}.npyd"
     if npyd.is_dir():
         d = {k: np.load(npyd / f"{k}.npy", mmap_mode="r") for k in ("time", "mag", "err", "offsets")}
     else:  # NpzFile re-reads an array on every access, so load each one once
@@ -188,11 +286,45 @@ def load_shard(shards, name, split, n, rng):
     meta = json.loads((Path(shards) / f"{name}_meta.json").read_text())
     labels = [r for r in json.loads((Path(shards) / f"{name}_labels.json").read_text())
               if meta[r["index"]]["split"] == split]
-    labels = [labels[i] for i in rng.permutation(len(labels))[:n]]
-    off = d["offsets"]
-    return [(d["time"][off[r["index"]]:off[r["index"] + 1]].astype(float),
-             d["mag"][off[r["index"]]:off[r["index"] + 1]].astype(float),
-             d["err"][off[r["index"]]:off[r["index"] + 1]].astype(float), 1 / r["freq"]) for r in labels]
+    off, out = d["offsets"], []
+    for i in rng.permutation(len(labels)):
+        a, b = int(off[labels[i]["index"]]), int(off[labels[i]["index"] + 1])
+        t, m, e = (np.asarray(d[k][a:b], np.float64) for k in ("time", "mag", "err"))
+        ok = np.isfinite(t) & np.isfinite(m) & np.isfinite(e) & (e > 0)
+        if ok.sum() >= min_points:
+            out.append((t[ok], m[ok], e[ok], 1 / labels[i]["freq"]))
+        if len(out) == n:
+            break
+    return out
+
+
+def star_conditions(stars, nbins):
+    """Per-star period, folded amplitude, median magnitude and scatter ratio (rms residual / median err)."""
+    P = np.array([s[3] for s in stars])
+    fits = [fold_binned(t, m, p, nbins) for t, m, e, p in stars]
+    amp = np.array([max(f[0].max() - f[0].min(), 1e-4) for f in fits])
+    med = np.array([np.median(s[1]) for s in stars])
+    scat = np.array([f[1] / np.median(s[2]) for f, s in zip(fits, stars)])
+    return P, amp, med, scat
+
+
+def shape_fakes(g, stars, s_idx, cond, guidance, steps, seed):
+    """Synthetic curves on each real star's own times and errors, white noise at that star's scatter."""
+    P, amp, med, scat = cond
+    has_mag = g.templates.mags_known(s_idx)
+    prof = g.sample_profiles(np.full(len(stars), s_idx), np.full(len(stars), -1), P, amp,
+                             med if has_mag else np.full(len(stars), np.nan), guidance, steps, seed=seed)
+    rng = np.random.default_rng(seed)
+    return [(t, M + A * (interp_profile(pr, (t - rng.uniform(0, p)) / p) - pr.mean()) + rng.normal(0, 1, len(t)) * e * s,
+             e, p) for (t, m, e, p), pr, A, M, s in zip(stars, prof, amp, med, scat)]
+
+
+def full_fakes(g, survey, stars, s_idx, cond, guidance, steps, seed, noise):
+    """Synthetic curves from Generator.generate: template cadence and template noise."""
+    P, amp, med, _ = cond
+    curves = g.generate(survey, P, amp, mag=med if g.templates.mags_known(s_idx) else None, n=len(stars), seed=seed,
+                        guidance=guidance, steps=steps, noise=noise)
+    return [(c["time"], c["mag"], c["err"], c["period"]) for c in curves], Counter(c["noise"] for c in curves)
 
 
 def cmd_classifier(a):
@@ -200,37 +332,60 @@ def cmd_classifier(a):
     rng = np.random.default_rng(a.seed)
     stars = load_shard(a.shards, a.shard, a.split, a.n, rng)
     s_idx = g.surveys.index(a.survey)
-    has_mag = g.templates.mags_known(s_idx)
-    P = np.array([s[3] for s in stars])
-    fits = [fold_binned(t, m, p, a.bins) for t, m, e, p in stars]
-    amp = np.array([f[0].max() - f[0].min() for f in fits])
-    med = np.array([np.median(s[1]) for s in stars])
-    scat = np.array([f[1] / np.median(s[2]) for f, s in zip(fits, stars)])
-    prof = g.sample_profiles(np.full(len(stars), s_idx), np.full(len(stars), -1), P, amp,
-                             med if has_mag else np.full(len(stars), np.nan), a.guidance, a.steps, seed=a.seed)
-    real, fake = [], []
-    for (t, m, e, p), pr, A, M, s in zip(stars, prof, amp, med, scat):
-        real.append(profile_features(t, m, p, a.bins))
-        mm = M + A * (interp_profile(pr, (t - rng.uniform(0, p)) / p) - pr.mean()) + rng.normal(0, 1, len(t)) * e * s
-        fake.append(profile_features(t, mm, p, a.bins))
-    X = torch.tensor(np.concatenate([real, fake]), dtype=torch.float32)
-    y = torch.tensor(np.r_[np.zeros(len(real)), np.ones(len(fake))], dtype=torch.float32)
-    star = np.r_[np.arange(len(real)), np.arange(len(fake))]
-    test = np.isin(star, rng.permutation(len(stars))[:len(stars) // 2])  # split by star: pairs stay together
-    torch.manual_seed(a.seed)
-    net = torch.nn.Sequential(torch.nn.Linear(X.shape[1], 64), torch.nn.ReLU(), torch.nn.Linear(64, 64),
-                              torch.nn.ReLU(), torch.nn.Linear(64, 1))
-    opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
-    tr = torch.as_tensor(~test)
-    for _ in range(a.epochs):
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(net(X[tr])[:, 0], y[tr])
-        opt.zero_grad(); loss.backward(); opt.step()
-    with torch.no_grad():
-        score = net(X[torch.as_tensor(test)])[:, 0].numpy()
-    res = {"shard": a.shard, "survey": a.survey, "n_stars": len(stars), "auc": auc(score, y.numpy()[test])}
-    print(json.dumps(res))
+    cond = star_conditions(stars, a.bins)
+    real = curve_features(stars, a.bins)
+    test_stars = np.isin(np.arange(len(stars)), rng.permutation(len(stars))[:len(stars) // 2])
+    res = {"shard": a.shard, "survey": a.survey, "n_stars": len(stars), "stat_names": list(STAT_NAMES)}
+    for mode in (("shape", "full") if a.mode == "both" else (a.mode,)):
+        if mode == "shape":
+            fake_curves, info = shape_fakes(g, stars, s_idx, cond, a.guidance, a.steps, a.seed), {}
+        else:
+            fake_curves, applied = full_fakes(g, a.survey, stars, s_idx, cond, a.guidance, a.steps, a.seed, a.noise)
+            info = {"noise_applied": dict(applied)}
+        fake = curve_features(fake_curves, a.bins)
+        res[mode] = {"auc": feature_set_aucs(real, fake, test_stars, a.epochs, a.seed), **info,
+                     "stat_median_real": dict(zip(STAT_NAMES, np.median(real[1], 0).round(4).tolist())),
+                     "stat_median_fake": dict(zip(STAT_NAMES, np.median(fake[1], 0).round(4).tolist()))}
+        print(mode, json.dumps(res[mode]["auc"]), flush=True)
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1))
+
+
+# ---------------------------------------------------------------- (d) guidance / steps sweep
+def cmd_sweep(a):
+    g = Generator.from_pretrained(a.model, device=a.device)
+    arrays, _ = load_bank(a.bank)
+    rng = np.random.default_rng(a.seed)
+    stars = load_shard(a.shards, a.shard, a.split, a.n, rng)
+    s_idx = g.surveys.index(a.survey)
+    cond = star_conditions(stars, a.bins)
+    real = curve_features(stars, a.bins)
+    test_stars = np.isin(np.arange(len(stars)), rng.permutation(len(stars))[:len(stars) // 2])
+    num = normalised_conditions(arrays, g.norm)
+    rows = np.flatnonzero(arrays["survey"] == s_idx)
+    rows = rng.choice(rows, min(a.n_cond, len(rows)), replace=False)
+    div_real = float(np.mean([mean_pairwise_rms(arrays["profile"][nearest_real(arrays, num, r, a.k_real)])
+                              for r in rows]))
+    table = {"shard": a.shard, "survey": a.survey, "n_stars": len(stars), "n_cond": len(rows),
+             "n_samples": a.n_samples, "k_real": a.k_real, "diversity_real": div_real, "rows": []}
+    for steps in [int(v) for v in a.step_list.split(",")]:
+        for guidance in [float(v) for v in a.guidances.split(",")]:
+            fake = curve_features(shape_fakes(g, stars, s_idx, cond, guidance, steps, a.seed), a.bins)
+            aucs = feature_set_aucs(real, fake, test_stars, a.epochs, a.seed, sets=("profile", "both"))
+            div = []
+            for r in rows:
+                k = a.n_samples
+                prof = g.sample_profiles(np.full(k, arrays["survey"][r]), np.full(k, arrays["cls"][r]),
+                                         np.full(k, arrays["period"][r]), np.full(k, arrays["amplitude"][r]),
+                                         np.full(k, arrays["mag"][r]), guidance, steps, seed=a.seed + int(r))
+                div.append(mean_pairwise_rms(prof))
+            row = {"guidance": guidance, "steps": steps, "shape_auc_profile": aucs["profile"],
+                   "shape_auc_both": aucs["both"], "diversity_fake": float(np.mean(div)),
+                   "diversity_ratio": float(np.mean(div)) / div_real}
+            table["rows"].append(row)
+            print(json.dumps(row), flush=True)
+    Path(a.out).write_text(json.dumps(table, indent=1))
+    print(f"wrote {a.out}")
 
 
 def main():
@@ -244,6 +399,12 @@ def main():
     common.add_argument("--steps", type=int, default=50)
     common.add_argument("--bins", type=int, default=32)
     common.add_argument("--out")
+    shard = argparse.ArgumentParser(add_help=False)
+    shard.add_argument("--shards", required=True)
+    shard.add_argument("--shard", required=True)
+    shard.add_argument("--survey", required=True, help="survey token of this shard, e.g. OGLE-I")
+    shard.add_argument("--split", default="test", help="shard split to draw real stars from (never in the bank)")
+    shard.add_argument("--epochs", type=int, default=300)
     s = sub.add_parser("grid", parents=[common])
     s.add_argument("--bank", required=True)
     s.add_argument("--n-cond", type=int, default=16)
@@ -257,15 +418,22 @@ def main():
     s.add_argument("--tol", type=float, default=0.01, help="relative period tolerance")
     s.add_argument("--fmax", type=float, default=10.0, help="max search frequency (1/day); raised to 1.5/P if needed")
     s.add_argument("--max-points", type=int, default=3000, help="random subsample for the periodogram")
+    s.add_argument("--noise", default="residual,gaussian", help="comma-separated noise modes to compare")
     s.set_defaults(func=cmd_period)
-    s = sub.add_parser("classifier", parents=[common])
-    s.add_argument("--shards", required=True)
-    s.add_argument("--shard", required=True)
-    s.add_argument("--survey", required=True, help="survey token of this shard, e.g. OGLE-I")
-    s.add_argument("--split", default="test", help="shard split to draw real stars from (never in the bank)")
+    s = sub.add_parser("classifier", parents=[common, shard])
     s.add_argument("--n", type=int, default=1000)
-    s.add_argument("--epochs", type=int, default=300)
+    s.add_argument("--mode", choices=["shape", "full", "both"], default="both")
+    s.add_argument("--noise", default="residual", help="noise mode of the full-mode synthetic curves")
     s.set_defaults(func=cmd_classifier)
+    s = sub.add_parser("sweep", parents=[common, shard])
+    s.add_argument("--bank", required=True, help="bank for the real nearest-neighbour profiles")
+    s.add_argument("--n", type=int, default=500, help="real stars for the classifier")
+    s.add_argument("--guidances", default="1,1.5,2,3,4")
+    s.add_argument("--step-list", default="25,50,100", help="DDIM step counts")
+    s.add_argument("--n-cond", type=int, default=16, help="conditions (bank rows of the survey) for diversity")
+    s.add_argument("--n-samples", type=int, default=8, help="samples per condition")
+    s.add_argument("--k-real", type=int, default=8, help="nearest real profiles per condition")
+    s.set_defaults(func=cmd_sweep, out="sweep.json")
     a = p.parse_args()
     a.func(a)
 

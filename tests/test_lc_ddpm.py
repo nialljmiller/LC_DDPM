@@ -6,7 +6,7 @@ import torch
 
 from lc_ddpm import Generator, generate
 from lc_ddpm.cli import main as cli_main
-from lc_ddpm.data import ProfileDataset, compute_norm, encode_conditions, load_bank
+from lc_ddpm.data import ProfileDataset, compute_norm, encode_conditions, load_bank, select_rows
 from lc_ddpm.diffusion import Diffusion, drop_conditions
 from lc_ddpm.model import UNet1D
 from lc_ddpm.render import TemplateBank, normalise_profiles, render
@@ -32,8 +32,16 @@ def fake_shapes(cls, n, rng):
     return normalise_profiles(p + rng.normal(0, 0.01, p.shape))
 
 
-def make_fake_bank(path, n=300, m=40, seed=0):
-    """Tiny bank in the docs/DESIGN.md format: profiles.npz, templates.npz, vocab.json."""
+def fake_resid(t, err, scatter, rng, outlier_frac=0.03):
+    """Bank-v2-like residuals: white noise at err * scatter, a slow trend and a few large outliers."""
+    r = rng.normal(0, 1, len(t)) * err * scatter + 0.02 * np.sin(2 * np.pi * t / rng.uniform(300, 900))
+    out = rng.uniform(size=len(t)) < outlier_frac
+    return r + out * rng.choice([-1, 1], len(t)) * rng.uniform(6, 15, len(t)) * err
+
+
+def make_fake_bank(path, n=300, m=40, seed=0, v2=True):
+    """Tiny bank in the docs/DESIGN.md format: profiles.npz, templates.npz, vocab.json.
+    v2 adds ``resid``/``scatter_rms`` to templates and ``repeats`` to profiles."""
     rng = np.random.default_rng(seed)
     path.mkdir(parents=True, exist_ok=True)
     cls = rng.integers(0, len(CLASSES), n)
@@ -50,18 +58,26 @@ def make_fake_bank(path, n=300, m=40, seed=0):
              survey=survey.astype(np.int16), cls=cls.astype(np.int16), tier=(rng.uniform(size=n) < 0.3).astype(np.int8),
              snr=rng.uniform(5, 200, n).astype(np.float32), chi2r=np.ones(n, np.float32),
              order=np.full(n, 4, np.int16), n_points=np.full(n, 100, np.int32), shard=np.array(["fake"] * n),
-             index=np.arange(n, dtype=np.int32), sourceid=np.array([f"s{i}" for i in range(n)]))
-    ts, es, off = [], [], [0]
+             index=np.arange(n, dtype=np.int32), sourceid=np.array([f"s{i}" for i in range(n)]),
+             **({"repeats": rng.choice([1, 2, 3, 4], n, p=[0.8, 0.1, 0.06, 0.04]).astype(np.int8)} if v2 else {}))
+    ts, es, rs, off = [], [], [], [0]
+    scatter = rng.uniform(0.8, 1.5, m)
     tsurv = np.arange(m) % len(SURVEYS)
     tmag = np.full(m, np.nan)
     for j in range(m):
         k = int(rng.integers(30, 200))
         ts.append(np.sort(rng.uniform(0, 1000, k))); es.append(rng.uniform(0.01, 0.05, k)); off.append(off[-1] + k)
+        rs.append(fake_resid(ts[-1], es[-1], scatter[j], rng))
         if tsurv[j] in MAG_KNOWN:
             tmag[j] = rng.uniform(*MAG_KNOWN[tsurv[j]])
+    v2_fields = {}
+    if v2:
+        mad = [1.4826 * np.median(np.abs(r - np.median(r))) / np.median(e) for r, e in zip(rs, es)]
+        v2_fields = {"resid": np.concatenate(rs).astype(np.float32), "scatter_rms": scatter.astype(np.float32)}
+        scatter = np.array(mad)
     np.savez(path / "templates.npz", time=np.concatenate(ts), err=np.concatenate(es).astype(np.float32),
              offsets=np.array(off, np.int64), survey=tsurv.astype(np.int16), mag=tmag.astype(np.float32),
-             scatter=rng.uniform(0.8, 1.5, m).astype(np.float32), sourceid=np.array([f"t{j}" for j in range(m)]))
+             scatter=scatter.astype(np.float32), sourceid=np.array([f"t{j}" for j in range(m)]), **v2_fields)
     (path / "vocab.json").write_text(json.dumps({"surveys": SURVEYS, "classes": CLASSES, "class_map": {}, "nbins": 128}))
     return path
 
@@ -152,7 +168,74 @@ def test_end_to_end(run_dir, tmp_path):
     assert item["x"].shape == (128,) and item["mask"].shape == (5,) and (ds.arrays["snr"][ds.rows] >= 20).all()
     out = tmp_path / "out.csv"
     cli_main(["generate", "--model", str(run_dir), "--survey", "OGLE-I", "--period", "0.55", "--amplitude", "0.4",
-              "--mag", "16", "--cls", "EB", "-n", "2", "--seed", "0", "--steps", "3", "--device", "cpu",
+              "--mag", "16", "--cls", "EB", "-n", "2", "--seed", "0", "--steps", "3", "--device", "cpu", "--noise", "gaussian",
               "--out", str(out)])
     lines = out.read_text().splitlines()
-    assert lines[0] == "id,time,mag,err" and len(json.loads(out.with_suffix(".json").read_text())) == 2
+    meta = json.loads(out.with_suffix(".json").read_text())
+    assert lines[0] == "id,time,mag,err" and len(meta) == 2 and meta[0]["noise"] == "gaussian"
+    assert all(c["noise"] == "residual" for c in a) and all(c["noise"] == "gaussian" for c in rel)
+
+
+def noise_of(tb, j, noise, seed, times=None):
+    """Rendered curve, its added noise (rendered minus noiseless; t0 is drawn first, so it matches) and
+    the curve's errors."""
+    prof = normalise_profiles(fake_shapes("SIN", 1, np.random.default_rng(0)))
+    args = (prof, [0.7], [0.3], [15.0], tb, [j])
+    c = render(*args, np.random.default_rng(seed), times=times, noise=noise)[0]
+    c0 = render(*args, np.random.default_rng(seed), times=times, noise=None)[0]
+    return c, c["mag"] - c0["mag"]
+
+
+@pytest.mark.parametrize("bank,noise,times,applied", [
+    ("v2", "residual", None, "residual"), ("v2", True, None, "residual"), ("v2", "gaussian", None, "gaussian"),
+    ("v2", "residual", "user", "gaussian"), ("v1", "residual", None, "gaussian"), ("v2", "none", None, "none"),
+    ("v2", False, None, "none")])
+def test_noise_modes(tmp_path, bank, noise, times, applied):
+    tb = TemplateBank(make_fake_bank(tmp_path, n=20, m=12, v2=bank == "v2") / "templates.npz")
+    j = 3
+    t = np.linspace(0, 300, 4000) if times == "user" else None
+    c, dm = noise_of(tb, j, noise, seed=5, times=t)
+    assert c["noise"] == applied
+    if applied == "none":
+        assert not dm.any()
+    elif applied == "residual":
+        r, e = tb.get_resid(j), tb.get(j)[1]
+        # a shifted, sign-flipped copy: rms, outliers and |resid| / err pairs are preserved exactly
+        np.testing.assert_allclose(np.sort(np.abs(dm)), np.sort(np.abs(r)), atol=1e-6)
+        np.testing.assert_allclose(np.sort(np.abs(dm) / c["err"]), np.sort(np.abs(r) / e), rtol=1e-6)
+        assert abs(np.sqrt(np.mean(dm ** 2)) / np.sqrt(np.mean(r ** 2)) - 1) < 1e-6
+        assert np.mean(np.abs(dm) / c["err"] > 5) == np.mean(np.abs(r) / e > 5) > 0
+        k = [int(np.argmin([np.abs(np.roll(r, s) * sg - noise_of(tb, j, noise, sd)[1]).max()
+                            for s in range(len(r)) for sg in (1, -1)])) for sd in range(12)]
+        assert len({x // 2 for x in k}) > 6 and len({x % 2 for x in k}) == 2  # shifts vary, both signs occur
+        np.testing.assert_array_equal(dm, noise_of(tb, j, noise, seed=5)[1])  # seeded
+    else:  # gaussian: N(0, (err * scatter)^2), errors resampled from the template for user times
+        z = dm / (c["err"] * c["scatter"])
+        assert abs(z.std() - 1) < 0.15 and abs(z.mean()) < 0.15
+        assert set(np.round(c["err"], 7)) <= set(np.round(tb.get(j)[1], 7))
+
+
+@pytest.mark.parametrize("v2,max_repeats,expect_max", [(True, 2, 2), (True, None, 4), (True, 1, 1), (False, 2, None),
+                                                      ("quality", None, None)])
+def test_bank_filters(tmp_path, v2, max_repeats, expect_max):
+    """max-repeats row filter (ignored for v1); "quality": TemplateBank.pick uses only quality templates
+    when the bank has ``quality`` and falls back to all templates of a survey that has none."""
+    if v2 == "quality":
+        d = make_fake_bank(tmp_path, n=20, m=24)
+        z = dict(np.load(d / "templates.npz"))
+        q = np.arange(24) % 3 == 0
+        q[z["survey"] == 5] = False  # survey 5 has no quality template
+        np.savez(d / "templates.npz", **z, quality=q)
+        tb, rng = TemplateBank(d / "templates.npz"), np.random.default_rng(0)
+        for s in range(6):
+            picked = {tb.pick(s, None, rng) for _ in range(60)}
+            pool = np.flatnonzero((tb.survey == s) & (q if q[tb.survey == s].any() else True))
+            assert picked == set(pool.tolist())
+        return
+    arrays, _ = load_bank(make_fake_bank(tmp_path, n=400, m=6, v2=v2))
+    rows = select_rows(arrays, max_repeats=max_repeats)
+    if expect_max is None:  # bank v1 has no repeats: the filter is ignored
+        assert "repeats" not in arrays and len(rows) == 400
+    else:
+        assert arrays["repeats"][rows].max() == expect_max
+        assert len(rows) == (arrays["repeats"] <= (max_repeats or 99)).sum()

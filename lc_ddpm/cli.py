@@ -33,7 +33,7 @@ def cmd_generate(a):
     from .api import Generator
     g = Generator.from_pretrained(a.model, templates=a.templates, device=a.device)
     curves = g.generate(a.survey, a.period, a.amplitude, mag=a.mag, cls=a.cls, n=a.n, seed=a.seed,
-                        guidance=a.guidance, steps=a.steps)
+                        guidance=a.guidance, steps=a.steps, noise=a.noise)
     out = Path(a.out)
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
@@ -72,6 +72,8 @@ def main(argv=None):
     g.add_argument("--seed", type=int)
     g.add_argument("--guidance", type=float, default=2.0)
     g.add_argument("--steps", type=int, default=50)
+    g.add_argument("--noise", choices=["residual", "gaussian", "none"], default="residual",
+                   help="residual: template star's real residuals (Gaussian for a v1 bank); gaussian; none")
     g.add_argument("--device")
     g.set_defaults(func=cmd_generate)
     i = sub.add_parser("info", parents=[common], help="print vocabulary and model card")

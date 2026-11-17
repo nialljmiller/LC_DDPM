@@ -8,6 +8,11 @@ The whole bank is loaded onto the device and batches are indexed directly. Check
 to ``--out/lc_ddpm.pt`` (the format ``lc_ddpm.Generator`` loads) with a ``templates.npz``
 symlink to the bank's, so ``Generator.from_pretrained(RUN_DIR)`` works.
 
+--max-repeats N (default 2) drops bank rows with ``repeats > N`` (bank v2; ignored for v1).
+--init CKPT starts from the weights of an exported ``lc_ddpm.pt`` (or a training ``ckpt_*.pt``) for
+fine-tuning; model config and condition normalisation are taken from it. Resuming from a
+``ckpt_*.pt`` in --out takes precedence over --init.
+
 Requires the package: run `pip install -e .` from the repo root first.
 """
 import argparse
@@ -85,6 +90,9 @@ def main():
     p.add_argument("--width", type=int, default=64)
     p.add_argument("--ema", type=float, default=0.9995)
     p.add_argument("--min-snr", type=float)
+    p.add_argument("--max-repeats", type=int, default=2,
+                   help="keep rows with repeats <= N (bank v2 only); negative = no filter")
+    p.add_argument("--init", help="checkpoint to initialise weights from (fine-tuning)")
     p.add_argument("--tier-weight", type=float, default=0.5, help="sampling weight of tier-1 rows (tier 0 = 1)")
     p.add_argument("--val-frac", type=float, default=0.02)
     p.add_argument("--val-max", type=int, default=8192, help="rows used for the validation loss")
@@ -97,14 +105,22 @@ def main():
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     dev = a.device or auto_device()
     arrays, vocab = load_bank(a.bank)
-    rows = select_rows(arrays, a.min_snr)
+    rows = select_rows(arrays, a.min_snr, max_repeats=a.max_repeats if a.max_repeats >= 0 else None)
     perm = np.random.default_rng(a.seed).permutation(rows)
     n_val = max(1, int(round(a.val_frac * len(rows))))
     val_rows, train_rows = np.sort(perm[:n_val][:a.val_max]), np.sort(perm[n_val:])
 
     ckpts = sorted(out.glob("ckpt_*.pt"))
     state = torch.load(ckpts[-1], map_location="cpu", weights_only=False) if ckpts else None
-    norm = state["norm"] if state else compute_norm({k: arrays[k][train_rows] for k in ("period", "amplitude", "mag")})
+    init = None
+    if a.init and state:
+        print(f"--init {a.init} ignored: resuming from {ckpts[-1].name}")
+    elif a.init:
+        init = torch.load(a.init, map_location="cpu", weights_only=False)
+        if "vocab" in init and (init["vocab"]["surveys"] != vocab["surveys"] or init["vocab"]["classes"] != vocab["classes"]):
+            raise SystemExit(f"--init {a.init}: survey/class vocabulary differs from the bank's vocab.json")
+    norm = (state or init or {}).get("norm") or compute_norm({k: arrays[k][train_rows]
+                                                              for k in ("period", "amplitude", "mag")})
 
     def tensors(r):
         X = torch.as_tensor(2 * arrays["profile"][r] - 1, dtype=torch.float32, device=dev)
@@ -116,7 +132,15 @@ def main():
     Xv, condv = tensors(val_rows)
     W = torch.as_tensor(row_weights(arrays, train_rows, a.tier_weight), device=dev)
 
-    model = UNet1D(len(vocab["surveys"]), len(vocab["classes"]), width=a.width, nbins=X.shape[1]).to(dev)
+    cfg = (state or init or {}).get("config")  # resumed or initialised runs keep their architecture
+    if cfg:
+        model = UNet1D(**cfg)
+    else:
+        model = UNet1D(len(vocab["surveys"]), len(vocab["classes"]), width=a.width, nbins=X.shape[1])
+    if init:  # exported lc_ddpm.pt / best.pt hold EMA weights in "state_dict"; ckpt_*.pt in "ema"
+        model.load_state_dict(init.get("state_dict") or init["ema"])
+        print(f"initialised weights from {a.init}")
+    model = model.to(dev)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
     step, best = 0, float("inf")
@@ -131,7 +155,9 @@ def main():
     torch.manual_seed(a.seed + step)
     grid_idx = torch.as_tensor(np.random.default_rng(1).choice(len(Xv), min(24, len(Xv)), replace=False), device=dev)
     card = lambda: {"bank": str(Path(a.bank).resolve()), "steps": step, "train_rows": int(len(train_rows)),
-                    "min_snr": a.min_snr, "tier_weight": a.tier_weight, "best_val_loss": best, "params": n_params,
+                    "min_snr": a.min_snr, "max_repeats": a.max_repeats,
+                    "init": str(Path(a.init).resolve()) if a.init else None, "tier_weight": a.tier_weight,
+                    "best_val_loss": best, "params": n_params,
                     "date": time.strftime("%Y-%m-%d")}
     log = open(out / "log.jsonl", "a")
     t_start, run_loss, run_n = time.time(), 0.0, 0
@@ -164,7 +190,7 @@ def main():
                     best = rec["val_loss"]
                     torch.save(export(ema, vocab, norm, card()), out / "best.pt")
                 torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                            "step": step, "best": best, "norm": norm, "args": vars(a)}, out / f"ckpt_{step:07d}.pt")
+                            "step": step, "best": best, "norm": norm, "config": ema.config, "args": vars(a)}, out / f"ckpt_{step:07d}.pt")
                 for old in sorted(out.glob("ckpt_*.pt"))[:-3]:
                     old.unlink()
                 sample_grid(ema, diff, Xv[grid_idx], {k: v[grid_idx] for k, v in condv.items()}, vocab,
