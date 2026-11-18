@@ -70,7 +70,7 @@ def main(argv=None):
     g.add_argument("--out", required=True, help="CSV path; metadata goes to the same name with .json")
     g.add_argument("--plot", help="PNG of folded curves (needs matplotlib)")
     g.add_argument("--seed", type=int)
-    g.add_argument("--guidance", type=float, default=2.0)
+    g.add_argument("--guidance", type=float, default=1.0)
     g.add_argument("--steps", type=int, default=50)
     g.add_argument("--noise", choices=["residual", "gaussian", "none"], default="residual",
                    help="residual: template star's real residuals (Gaussian for a v1 bank); gaussian; none")

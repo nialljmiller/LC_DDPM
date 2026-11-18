@@ -428,7 +428,7 @@ def main():
     common.add_argument("--model", required=True, help="checkpoint or run directory")
     common.add_argument("--device")
     common.add_argument("--seed", type=int, default=0)
-    common.add_argument("--guidance", type=float, default=2.0)
+    common.add_argument("--guidance", type=float, default=1.0)
     common.add_argument("--steps", type=int, default=50)
     common.add_argument("--bins", type=int, default=32)
     common.add_argument("--out")

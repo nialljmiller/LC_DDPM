@@ -77,7 +77,7 @@ class Generator:
     def classes(self):
         return list(self.vocab["classes"])
 
-    def sample_profiles(self, survey, cls, period, amplitude, mag, guidance=2.0, steps=50, seed=None, batch=1024):
+    def sample_profiles(self, survey, cls, period, amplitude, mag, guidance=1.0, steps=50, seed=None, batch=1024):
         """Normalised profiles (N, nbins) for per-curve condition arrays (survey/cls int, -1 = missing;
         period/amplitude/mag float, NaN = missing)."""
         gen = torch.Generator().manual_seed(int(seed)) if seed is not None else None
@@ -90,7 +90,7 @@ class Generator:
             out.append(((x.cpu().numpy() + 1) / 2))
         return normalise_profiles(np.concatenate(out))
 
-    def generate(self, survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=2.0,
+    def generate(self, survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=1.0,
                  steps=50, noise="residual"):
         """Generate ``n`` light curves of one survey.
 
@@ -133,7 +133,7 @@ class Generator:
 _DEFAULT = {}
 
 
-def generate(survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=2.0, steps=50,
+def generate(survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=1.0, steps=50,
              model=None, noise="residual"):
     """Module-level shortcut for :meth:`Generator.generate`. ``model`` may be a Generator, a
     checkpoint path or directory, or None (cached default from $LC_DDPM_HOME or ~/.cache/lc_ddpm)."""

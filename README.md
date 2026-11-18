@@ -30,6 +30,9 @@ lc-ddpm info          # surveys, classes and the model card
    It is a v-prediction DDPM (cosine schedule) sampled with DDIM and classifier-free guidance.
    Every condition (survey, class, log period, log amplitude, magnitude) is dropped at random
    during training, so any subset of them can be given at generation time.
+   The default guidance is w = 1 (plain conditional sampling). Higher w makes samples for one
+   condition more alike: at w = 2 their spread is about 0.64 of the spread of the nearest real
+   profiles, at w = 1 about 0.92 (VVV validation sweep, run v2b).
 2. **Cadence and noise (real template stars).** The shape is placed on the observation times and
    per-point errors of a real star from the requested survey, chosen among the stars closest in
    magnitude. By default (`noise="residual"`) the noise is that star's own residual series (its

@@ -54,7 +54,7 @@ class Diffusion:
         return err.mean() if weight is None else (err * weight).sum() / weight.sum()
 
     @torch.no_grad()
-    def sample(self, model, cond, steps=50, guidance=2.0, eta=0.0, generator=None, nbins=128):
+    def sample(self, model, cond, steps=50, guidance=1.0, eta=0.0, generator=None, nbins=128):
         """DDIM sampling. guidance w: v = v_uncond + w (v_cond - v_uncond); w = 1 is plain conditional.
 
         Noise is drawn on the CPU from ``generator`` so a seed gives the same result on any device.
