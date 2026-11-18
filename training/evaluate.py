@@ -18,8 +18,11 @@ classifier: real light curves from an NN_Periodogram shard (``NAME.npyd/`` memor
             mode full:  synthetic curves from Generator.generate for the same survey/period/amplitude/mag
             (template cadence and template noise from the bank, i.e. training-split stars): the
             realistic pipeline.
+            Real stars above --cap-points points are subsampled as the bank builder does for templates.
             Feature sets, each reported: profile (folded binned normalised profile at the known period
-            + residual rms / amplitude), stats (cadence-independent statistics, STAT_NAMES), both.
+            + residual rms / amplitude), stats (noise and light-curve statistics, STAT_NAMES[NOISE]),
+            both (profile + stats), cadence (point count and time span only, STAT_NAMES[CADENCE]).
+            With --period-n, Lomb-Scargle period recovery on real and synthetic curves of the same stars.
 sweep:      for each guidance and DDIM step count: shape-mode classifier AUC on one shard and the
             diversity of samples for fixed conditions (mean pairwise rms distance among samples)
             vs that among the nearest real bank profiles; JSON table.
@@ -107,6 +110,8 @@ def profile_features(t, m, period, nbins):
 
 STAT_NAMES = ("log10_n_points", "log10_span", "skewness", "excess_kurtosis", "eta_resid", "outlier_frac_3sigma",
               "resid_rms_over_median_err")
+CADENCE = [0, 1]          # columns of STAT_NAMES that describe the cadence only ("cadence" feature set)
+NOISE = [2, 3, 4, 5, 6]   # columns that describe the light curve and its noise ("stats" feature set)
 
 
 def stat_features(t, m, e, period, nbins):
@@ -163,13 +168,31 @@ def mlp_auc(X, y, test, epochs, seed):
     return auc(score, y[test])
 
 
-def feature_set_aucs(real, fake, test_stars, epochs, seed, sets=("profile", "stats", "both")):
+def feature_set_aucs(real, fake, test_stars, epochs, seed, sets=("profile", "stats", "both", "cadence")):
     """AUC per feature set. real/fake: (profile, stats) feature arrays, row i of both belongs to star i;
-    the same star split (``test_stars``, boolean per star) is used for every set."""
+    the same star split (``test_stars``, boolean per star) is used for every set. "stats" uses the
+    noise statistics only and "both" is profile + noise statistics; the cadence columns (point count,
+    time span) are scored separately as "cadence" so a cadence difference cannot pass for a noise one."""
     y = np.r_[np.zeros(len(real[0])), np.ones(len(fake[0]))]
     test = np.r_[test_stars, test_stars]
-    cols = {"profile": lambda f: f[0], "stats": lambda f: f[1], "both": lambda f: np.concatenate(f, 1)}
+    cols = {"profile": lambda f: f[0], "stats": lambda f: f[1][:, NOISE], "cadence": lambda f: f[1][:, CADENCE],
+            "both": lambda f: np.concatenate([f[0], f[1][:, NOISE]], 1)}
     return {k: mlp_auc(np.concatenate([cols[k](real), cols[k](fake)]), y, test, epochs, seed) for k in sets}
+
+
+def period_recovery(curves, max_points, fmax, tol, seed, method="ls"):
+    """Fractions of curves (t, m, e, period) whose best periodogram period is within ``tol`` (relative) of
+    the label, and within ``tol`` of 0.5, 1 or 2 times it. Curves are subsampled to ``max_points``."""
+    rng = np.random.default_rng(seed)
+    exact = alias = 0
+    for t, m, e, p in curves:
+        if len(t) > max_points:
+            keep = np.sort(rng.choice(len(t), max_points, replace=False))
+            t, m, e = t[keep], m[keep], e[keep]
+        ratio = best_period(t, m, e, max(fmax, 1.5 / p), method=method) / p
+        exact += abs(ratio - 1) < tol
+        alias += min(abs(ratio - k) / k for k in (0.5, 1, 2)) < tol
+    return {"period_exact": exact / len(curves), "period_with_aliases": alias / len(curves)}
 
 
 def bank_conditions(arrays, rows, vocab):
@@ -274,9 +297,11 @@ def cmd_period(a):
 
 
 # ---------------------------------------------------------------- (c) real vs synthetic classifier
-def load_shard(shards, name, split, n, rng, min_points=10):
+def load_shard(shards, name, split, n, rng, min_points=10, max_points=None):
     """Up to ``n`` random stars of ``split`` as (t, m, e, period). Arrays come from the memory-mapped
-    ``NAME.npyd/`` directory when present; otherwise each ``NAME.npz`` array is read once."""
+    ``NAME.npyd/`` directory when present; otherwise each ``NAME.npz`` array is read once. Stars with
+    more than ``max_points`` points are randomly subsampled to that many (the bank builder does the same
+    to Kepler and TESS templates, so real and synthetic curves then have comparable cadences)."""
     npyd = Path(shards) / f"{name}.npyd"
     if npyd.is_dir():
         d = {k: np.load(npyd / f"{k}.npy", mmap_mode="r") for k in ("time", "mag", "err", "offsets")}
@@ -291,6 +316,8 @@ def load_shard(shards, name, split, n, rng, min_points=10):
         a, b = int(off[labels[i]["index"]]), int(off[labels[i]["index"] + 1])
         t, m, e = (np.asarray(d[k][a:b], np.float64) for k in ("time", "mag", "err"))
         ok = np.isfinite(t) & np.isfinite(m) & np.isfinite(e) & (e > 0)
+        if max_points and ok.sum() > max_points:
+            ok[np.flatnonzero(ok)[np.sort(rng.permutation(ok.sum())[max_points:])]] = False
         if ok.sum() >= min_points:
             out.append((t[ok], m[ok], e[ok], 1 / labels[i]["freq"]))
         if len(out) == n:
@@ -330,12 +357,16 @@ def full_fakes(g, survey, stars, s_idx, cond, guidance, steps, seed, noise):
 def cmd_classifier(a):
     g = Generator.from_pretrained(a.model, device=a.device)
     rng = np.random.default_rng(a.seed)
-    stars = load_shard(a.shards, a.shard, a.split, a.n, rng)
+    stars = load_shard(a.shards, a.shard, a.split, a.n, rng, max_points=a.cap_points)
     s_idx = g.surveys.index(a.survey)
     cond = star_conditions(stars, a.bins)
     real = curve_features(stars, a.bins)
     test_stars = np.isin(np.arange(len(stars)), rng.permutation(len(stars))[:len(stars) // 2])
-    res = {"shard": a.shard, "survey": a.survey, "n_stars": len(stars), "stat_names": list(STAT_NAMES)}
+    res = {"shard": a.shard, "survey": a.survey, "n_stars": len(stars), "stat_names": list(STAT_NAMES),
+           "cap_points": a.cap_points}
+    if a.period_n:
+        res["period_real"] = period_recovery(stars[:a.period_n], 3000, 10.0, 0.01, a.seed)
+        print("period real", json.dumps(res["period_real"]), flush=True)
     for mode in (("shape", "full") if a.mode == "both" else (a.mode,)):
         if mode == "shape":
             fake_curves, info = shape_fakes(g, stars, s_idx, cond, a.guidance, a.steps, a.seed), {}
@@ -346,7 +377,9 @@ def cmd_classifier(a):
         res[mode] = {"auc": feature_set_aucs(real, fake, test_stars, a.epochs, a.seed), **info,
                      "stat_median_real": dict(zip(STAT_NAMES, np.median(real[1], 0).round(4).tolist())),
                      "stat_median_fake": dict(zip(STAT_NAMES, np.median(fake[1], 0).round(4).tolist()))}
-        print(mode, json.dumps(res[mode]["auc"]), flush=True)
+        if a.period_n:
+            res[mode]["period"] = period_recovery(fake_curves[:a.period_n], 3000, 10.0, 0.01, a.seed)
+        print(mode, json.dumps(res[mode]["auc"]), json.dumps(res[mode].get("period", {})), flush=True)
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1))
 
@@ -356,7 +389,7 @@ def cmd_sweep(a):
     g = Generator.from_pretrained(a.model, device=a.device)
     arrays, _ = load_bank(a.bank)
     rng = np.random.default_rng(a.seed)
-    stars = load_shard(a.shards, a.shard, a.split, a.n, rng)
+    stars = load_shard(a.shards, a.shard, a.split, a.n, rng, max_points=a.cap_points)
     s_idx = g.surveys.index(a.survey)
     cond = star_conditions(stars, a.bins)
     real = curve_features(stars, a.bins)
@@ -405,6 +438,9 @@ def main():
     shard.add_argument("--survey", required=True, help="survey token of this shard, e.g. OGLE-I")
     shard.add_argument("--split", default="test", help="shard split to draw real stars from (never in the bank)")
     shard.add_argument("--epochs", type=int, default=300)
+    shard.add_argument("--cap-points", type=int, default=20000,
+                       help="subsample real stars to at most this many points (the bank builder's cap for "
+                            "Kepler and TESS templates); 0 = no cap")
     s = sub.add_parser("grid", parents=[common])
     s.add_argument("--bank", required=True)
     s.add_argument("--n-cond", type=int, default=16)
@@ -424,6 +460,9 @@ def main():
     s.add_argument("--n", type=int, default=1000)
     s.add_argument("--mode", choices=["shape", "full", "both"], default="both")
     s.add_argument("--noise", default="residual", help="noise mode of the full-mode synthetic curves")
+    s.add_argument("--period-n", type=int, default=300,
+                   help="also run Lomb-Scargle period recovery on this many real and synthetic curves (same "
+                        "conditions), 0 = skip")
     s.set_defaults(func=cmd_classifier)
     s = sub.add_parser("sweep", parents=[common, shard])
     s.add_argument("--bank", required=True, help="bank for the real nearest-neighbour profiles")
