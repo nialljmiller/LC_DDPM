@@ -3,7 +3,7 @@
     python training/train.py --bank BANK_DIR --out RUN_DIR [--steps 200000 --batch 512 --width 64]
 
 The whole bank is loaded onto the device and batches are indexed directly. Checkpoints
-(``ckpt_XXXXXXX.pt``, last 3 kept, plus ``best.pt`` by validation loss) go to --out every
+(``ckpt_XXXXXXX.pt``, all kept, plus ``best.pt`` by validation loss) go to --out every
 --ckpt-every steps; a rerun resumes from the newest one. The final EMA weights are written
 to ``--out/lc_ddpm.pt`` (the format ``lc_ddpm.Generator`` loads) with a ``templates.npz``
 symlink to the bank's, so ``Generator.from_pretrained(RUN_DIR)`` works.
@@ -191,8 +191,6 @@ def main():
                     torch.save(export(ema, vocab, norm, card()), out / "best.pt")
                 torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                             "step": step, "best": best, "norm": norm, "config": ema.config, "args": vars(a)}, out / f"ckpt_{step:07d}.pt")
-                for old in sorted(out.glob("ckpt_*.pt"))[:-3]:
-                    old.unlink()
                 sample_grid(ema, diff, Xv[grid_idx], {k: v[grid_idx] for k, v in condv.items()}, vocab,
                             out / f"samples_{step:07d}.png")
             log.write(json.dumps(rec) + "\n"); log.flush()

@@ -56,8 +56,9 @@ def measure_channels(m, e, amplitude):
 
 
 def measure_values(x, mag, amplitude):
-    """Inverse of measure_channels: (mag + A x0, A 10^x1)."""
-    return mag + amplitude * x[:, 0], amplitude * 10.0 ** x[:, 1]
+    """Inverse of measure_channels: (mag + A x0, A 10^x1). The error channel is clipped to
+    10^-5 .. 10^1 times the amplitude, so a poorly trained model cannot return zero or infinite errors."""
+    return mag + amplitude * x[:, 0], amplitude * 10.0 ** np.clip(x[:, 1], -5.0, 1.0)
 
 
 def log_gaps(t):

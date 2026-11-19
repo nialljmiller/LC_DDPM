@@ -3,7 +3,7 @@
     python training/train_v3.py --data V3_DIR --out RUN_DIR --stage cadence [--batch 8 --accum 4 --steps 200000]
     python training/train_v3.py --data V3_DIR --out RUN_DIR --stage measure [--batch 8 --accum 4 --steps 200000]
 
-Both stages share RUN_DIR. Each stage keeps its log.jsonl, ckpt_XXXXXXX.pt (last 3) and best.pt (by
+Both stages share RUN_DIR. Each stage keeps its log.jsonl, ckpt_XXXXXXX.pt (all kept) and best.pt (by
 validation loss) in RUN_DIR/<stage>/ and resumes from the newest ckpt there. The final EMA weights go to
 RUN_DIR/lc_ddpm_<stage>.pt, and RUN_DIR/cadences.npz links to the training file's cadences.npz, so
 ``lc_ddpm.Generator.from_pretrained(RUN_DIR)`` loads the v3 generator once both stages exist.
@@ -206,8 +206,6 @@ def main(argv=None):
                 torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                             "step": step, "best": best, "norm": norm, "config": ema.config, "args": vars(a)},
                            out / f"ckpt_{step:07d}.pt")
-                for old in sorted(out.glob("ckpt_*.pt"))[:-3]:
-                    old.unlink()
                 sample_plot(ema, diff, arrays, plot_rows, a.stage, norm, n_max, vocab, dev, out / f"samples_{step:07d}.png")
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(json.dumps(rec), flush=True)
