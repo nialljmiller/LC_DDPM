@@ -36,6 +36,8 @@ ROW_KEYS = ("survey", "cls", "period", "amplitude", "mag", "tier", "snr", "repea
 def work(job):
     """Windowed examples for a list of (bank row, index, period) of one shard."""
     shard_dir, shard, items, n_max = job
+    for other in [k for k in bb._ARR if k != shard]:  # keep one shard's arrays per worker (npz shards are read whole)
+        del bb._ARR[other]
     out = []
     for row, i, period in items:
         t, m, e = bb.load_star(shard_dir, shard, i, subsample=False)

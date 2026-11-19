@@ -150,7 +150,7 @@ def compute_norm_v3(arrays, rows, stage, max_rows=20000, seed=0):
     gaps = np.concatenate(gaps)
     chans = np.concatenate(chans) if chans else gaps[:, None]
     ms = lambda x: ([float(np.nanmean(c)) if np.isfinite(c).any() else 0.0 for c in x.T],
-                    [max(float(np.nanstd(c)), 1e-6) if np.isfinite(c).sum() > 1 else 1.0 for c in x.T])
+                    [float(np.nanstd(c)) if np.isfinite(c).sum() > 1 and np.nanstd(c) > 0 else 1.0 for c in x.T])
     (mean, std), (cm, cs) = ms(num), ms(chans)
     return {"stage": stage, "names": list(NUM_NAMES[stage]), "mean": mean, "std": std, "chan_mean": cm,
             "chan_std": cs, "gap_mean": float(gaps.mean()), "gap_std": max(float(gaps.std()), 1e-6)}
