@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .api_v3 import CADENCE_NAME, CADENCES_NAME, MEASURE_NAME, GeneratorV3  # noqa: F401 (re-exported)
 from .data import encode_conditions
 from .diffusion import Diffusion
 from .model import UNet1D
@@ -25,6 +26,10 @@ def auto_device():
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def is_v3(path):
+    return torch.load(path, map_location="cpu", weights_only=False).get("format") == "lc_ddpm-3"
 
 
 def build_model(ckpt):
@@ -59,11 +64,19 @@ class Generator:
 
     @classmethod
     def from_pretrained(cls, path_or_dir=None, templates=None, device=None):
-        """Load from a checkpoint file or a directory holding lc_ddpm.pt and templates.npz.
-        Default directory: $LC_DDPM_HOME, else ~/.cache/lc_ddpm/."""
+        """Load from a checkpoint file or a directory. Default directory: $LC_DDPM_HOME, else ~/.cache/lc_ddpm/.
+
+        A directory holding ``lc_ddpm_measure.pt`` (v3) gives a :class:`~lc_ddpm.api_v3.GeneratorV3`;
+        otherwise ``lc_ddpm.pt`` + ``templates.npz`` give the v2 Generator. A checkpoint file is
+        dispatched by its ``format`` key ("lc_ddpm-3"; absent or "lc_ddpm-2" = v2). For a v3 measure
+        checkpoint file, ``lc_ddpm_cadence.pt`` and ``cadences.npz`` are looked up next to it."""
         path = Path(path_or_dir) if path_or_dir is not None else default_home()
+        if path.is_dir() and (path / MEASURE_NAME).exists():
+            return GeneratorV3.from_dir(path, device)
         if path.is_dir():
             path = path / CHECKPOINT_NAME
+        if path.is_file() and is_v3(path):
+            return GeneratorV3(path, path.with_name(CADENCE_NAME), path.with_name(CADENCES_NAME), device)
         if not path.exists():
             hint = f"download from {WEIGHTS_URL}" if WEIGHTS_URL else "no public download exists yet; train one with training/train.py"
             raise FileNotFoundError(f"no LC_DDPM weights at {path} (set LC_DDPM_HOME or pass a path; {hint})")
@@ -134,13 +147,16 @@ _DEFAULT = {}
 
 
 def generate(survey, period, amplitude, mag=None, cls=None, n=1, seed=None, times=None, guidance=1.0, steps=50,
-             model=None, noise="residual"):
-    """Module-level shortcut for :meth:`Generator.generate`. ``model`` may be a Generator, a
-    checkpoint path or directory, or None (cached default from $LC_DDPM_HOME or ~/.cache/lc_ddpm)."""
-    if not isinstance(model, Generator):
+             model=None, noise="residual", **v3):
+    """Module-level shortcut for :meth:`Generator.generate` (v2) or :meth:`GeneratorV3.generate` (v3).
+    ``model`` may be a Generator, a GeneratorV3, a checkpoint path or directory, or None (cached default
+    from $LC_DDPM_HOME or ~/.cache/lc_ddpm). ``noise`` applies to v2 only; v3 keywords (n_points, span,
+    cadence, batch) to v3 only."""
+    if not isinstance(model, (Generator, GeneratorV3)):
         key = str(model)
         if key not in _DEFAULT:
             _DEFAULT[key] = Generator.from_pretrained(model)
         model = _DEFAULT[key]
+    kw = v3 if isinstance(model, GeneratorV3) else {"noise": noise, **v3}
     return model.generate(survey, period, amplitude, mag=mag, cls=cls, n=n, seed=seed, times=times,
-                          guidance=guidance, steps=steps, noise=noise)
+                          guidance=guidance, steps=steps, **kw)

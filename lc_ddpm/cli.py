@@ -30,10 +30,14 @@ def plot_curves(curves, path, max_curves=12):
 
 
 def cmd_generate(a):
-    from .api import Generator
+    from .api import Generator, GeneratorV3
     g = Generator.from_pretrained(a.model, templates=a.templates, device=a.device)
+    if isinstance(g, GeneratorV3):
+        kw = {"n_points": a.n_points, "span": a.span, "cadence": a.cadence}
+    else:
+        kw = {"noise": a.noise}
     curves = g.generate(a.survey, a.period, a.amplitude, mag=a.mag, cls=a.cls, n=a.n, seed=a.seed,
-                        guidance=a.guidance, steps=a.steps, noise=a.noise)
+                        guidance=a.guidance, steps=a.steps, **kw)
     out = Path(a.out)
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
@@ -73,7 +77,11 @@ def main(argv=None):
     g.add_argument("--guidance", type=float, default=1.0)
     g.add_argument("--steps", type=int, default=50)
     g.add_argument("--noise", choices=["residual", "gaussian", "none"], default="residual",
-                   help="residual: template star's real residuals (Gaussian for a v1 bank); gaussian; none")
+                   help="v2 only. residual: template star's real residuals (Gaussian for a v1 bank); gaussian; none")
+    g.add_argument("--n-points", type=int, help="v3: points per curve (default: from a training example)")
+    g.add_argument("--span", type=float, help="v3: time span in days (default: from a training example)")
+    g.add_argument("--cadence", choices=["model", "real"], default="model",
+                   help="v3: times from the cadence model or from a real training example")
     g.add_argument("--device")
     g.set_defaults(func=cmd_generate)
     i = sub.add_parser("info", parents=[common], help="print vocabulary and model card")
