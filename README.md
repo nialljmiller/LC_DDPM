@@ -93,6 +93,55 @@ python training/evaluate.py --help
 `RUN_DIR/lc_ddpm.pt` together with `templates.npz` is everything `Generator.from_pretrained(RUN_DIR)`
 needs. The design and file formats are documented in [docs/DESIGN.md](docs/DESIGN.md).
 
+## v3: generated measured light curves (in development)
+
+v3 ([docs/DESIGN_v3.md](docs/DESIGN_v3.md)) generates every part of a light curve: observation times,
+magnitudes and per-point errors. Two diffusion models (transformers over the points, same v-prediction,
+cosine schedule, DDIM and classifier-free guidance as v2) are trained separately:
+
+1. **cadence model**, p(times | survey, n, span), on sorted log time gaps;
+2. **measurement model**, p(mag, err | times, survey, class, period, amplitude, magnitude, span), which
+   sees each point's time and exact phase features sin, cos(2 pi k t / P), k = 1..4.
+
+At most 1024 points per curve. Period and amplitude are requested, not exact by construction; the
+evaluation measures how often they come out. No v3 weights are published yet.
+
+```python
+from lc_ddpm import Generator
+
+g = Generator.from_pretrained("RUN_DIR")    # a v3 run directory gives a GeneratorV3
+curves = g.generate("OGLE-I", period=0.55, amplitude=0.4, mag=16.0, cls="RR", n=10, seed=1)
+c = curves[0]
+c["time"], c["mag"], c["err"]                # all generated; time in days from the first point
+c["n_points"], c["span"], c["cadence"]       # "model", "real" or "user"
+
+g.generate("OGLE-I", 0.55, 0.4, n_points=300, span=1500.0)     # choose length and time span
+g.generate("OGLE-I", 0.55, 0.4, times=my_times)                # your times: measurement model only
+g.generate("OGLE-I", 0.55, 0.4, cadence="real")                # times of a real training-split star
+```
+
+Without `n_points`/`span`, both are taken from one training-split example of the survey (among the 50
+nearest in log period), and for surveys with absolute magnitudes `mag=None` takes that example's
+magnitude. `lc-ddpm generate` accepts `--n-points`, `--span` and `--cadence` for a v3 model.
+`Generator.from_pretrained(dir)` returns the v3 generator when the directory holds `lc_ddpm_measure.pt`,
+otherwise the v2 generator (`lc_ddpm.pt` + `templates.npz`); a checkpoint file is dispatched by its
+`format` key. v2 stays available unchanged as the baseline.
+
+### Training v3
+
+```bash
+# 1. Training file: bank v2.2 stars (training split only), cut with the window rule
+python training/build_v3.py --shards SHARD_DIR --bank BANK_V22_DIR --out V3_DIR --workers 16
+
+# 2. Both stages into one run directory (each resumes from RUN_DIR/<stage>/ckpt_*.pt).
+#    6 GB GPU (RTX 3050): --batch 16 --accum 2; on out-of-memory use --batch 8 --accum 4 or --grad-ckpt
+python training/train_v3.py --data V3_DIR --out RUN_DIR --stage cadence --batch 16 --accum 2
+python training/train_v3.py --data V3_DIR --out RUN_DIR --stage measure --batch 16 --accum 2
+
+# 3. Real vs synthetic on validation stars of one shard, per survey and class (optionally against v2)
+python training/evaluate_v3.py --model RUN_DIR --shards SHARD_DIR --shard kepler_eb --v2-model V2_RUN --out eval.json
+```
+
 ## History
 
 Versions before 2.0 (2025 to early 2026) tiled light curves into 2-D images and trained a 2-D

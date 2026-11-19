@@ -118,3 +118,59 @@ synthetic, per survey and class) is run; whole surveys or classes whose syntheti
 below that of real stars are left out. Individual curves are never filtered by whether Lomb-Scargle
 recovers them (that would keep only easy cases). Conditions for the synthetic shard are drawn only from
 bank v2.2 rows (training-split stars).
+
+## Implementation record (2026-11-19)
+
+Facts of the implementation; the decisions above are unchanged.
+
+**Code.** `lc_ddpm/data_v3.py` (window rule, representation, per-point inputs, training-file loader, batches),
+`lc_ddpm/model.py` (`PointTransformer`), `lc_ddpm/diffusion.py` (`SeqDiffusion`, `ddim_step` shared with v2),
+`lc_ddpm/api_v3.py` (`GeneratorV3`), `training/build_v3.py`, `training/train_v3.py`, `training/evaluate_v3.py`,
+`tests/test_v3.py`.
+
+**Window rule details.** Rule 4 is checked first on the whole (finite, time-sorted) curve. Rule 2 uses one
+random start, no retries. Rule 3's window of width W = min(3 P, span) starts at a randomly chosen observation
+time t_j with t_j - t_0 <= span - W, so it always holds at least one point. Examples with fewer than
+`MIN_POINTS = 10` points after the rule are dropped. Windows are drawn once at build time, seeded per star
+(`build_bank.seed_of(shard, index, salt=3)`); evaluation applies the same function and seed to real stars.
+S is the span of the selected points (last minus first time), not W. Light curves are read with
+`build_bank.load_star(..., subsample=False)` (no Kepler/TESS thinning), then sorted by time.
+
+**Training file** (`build_v3.py --out V3_DIR`):
+
+| file / key | dtype | meaning |
+|---|---|---|
+| `train_v3.npz` `time` | float64 (P,) | concatenated times, days from each window's first point |
+| `obs_mag`, `obs_err` | float32 (P,) | measured magnitudes and errors |
+| `offsets` | int64 (N+1,) | example i is `[offsets[i], offsets[i+1])` |
+| `n_max` | int32 scalar | N_MAX used |
+| `survey`, `cls`, `period`, `amplitude`, `mag`, `tier`, `snr`, `repeats`, `shard`, `index`, `sourceid` | as bank | copied from the bank v2.2 row |
+| `bank_row` | int32 (N,) | row in the bank's profiles.npz |
+| `rule` | int8 (N,) | window rule used (1, 2, 3) |
+| `n_points`, `n_total` | int32 (N,) | points in the window / in the cleaned star |
+| `span` | float64 (N,) | S, days |
+| `cadences.npz` | | up to 2000 examples per survey: `time`, `offsets`, `survey`, `period`, `mag`, `span`, `n_points`, `sourceid` (cadence="real") |
+| `vocab.json` | | copy of the bank's |
+| `summary.json` | | counts per survey and rule, dropped stars by reason (`not_train`, `not_in_shards`, `short_span`, `too_few_points`) |
+
+Guard: a bank row is also dropped if its shard entry is not `split == "train"` or its base ID is in the bank's
+`excluded.json`.
+
+**Model inputs.** Targets are standardised per channel with training-set mean/std (`norm` in the checkpoint):
+measure = [(m - median m)/A, log10(e/A)], cadence = log10(dt_i / S) floored at 1e-9. Per-point inputs:
+measure = [x = t/S, sin/cos(pi 2^j x) j < 10, standardised log gaps to previous and next point, sin/cos(2 pi k t/P)
+k = 1..4] (31 columns; phase computed in float64 numpy); cadence = [sin/cos(pi 2^j i/N_MAX) j <= 10, i/(n-1)]
+for gap index i (23 columns). Numeric conditions: measure (log10 P, log10 A, mag, log10 S), with survey and class;
+cadence (log10 n, log10 S), with survey only. The phase features are zeroed whenever the period condition is
+dropped, so the unconditional branch of guidance has no period information. Generated gaps are rescaled to
+sum to S (span exact). No clamp on predicted x0 for v3.
+
+**Network.** `PointTransformer`: linear embedding of [noisy channels, per-point inputs], 8 blocks of width 256,
+8 heads, MLP ratio 4, adaLN-Zero conditioning on (diffusion step + condition embedding), key-padding mask in
+`scaled_dot_product_attention`, zero output at padded points; about 10.0 M parameters per stage.
+Batches are padded to the longest example rounded up to a multiple of 8.
+
+**Run directory.** `RUN_DIR/lc_ddpm_cadence.pt`, `RUN_DIR/lc_ddpm_measure.pt` (keys `format = "lc_ddpm-3"`,
+`stage`, `config`, `state_dict` (EMA), `vocab`, `norm`, `n_max`, `T`, `card`, and for measure `defaults`:
+survey, period, n_points, span, mag of up to 20000 training examples per survey), `RUN_DIR/cadences.npz`
+(symlink to the training file's), `RUN_DIR/<stage>/{log.jsonl, best.pt, ckpt_*.pt, samples_*.png}`.
