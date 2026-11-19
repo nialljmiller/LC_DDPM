@@ -73,15 +73,60 @@ class Diffusion:
             tt = torch.full((2 * B,), t, device=device, dtype=torch.long)
             v = model(torch.cat([x, x]), tt, both["survey"], both["cls"], both["num"], both["mask"]).float()
             v = v[B:] + guidance * (v[:B] - v[B:])
-            ab = ab_all[t]
-            x0 = (ab.sqrt() * x - (1 - ab).sqrt() * v).clamp(-1, 1)
-            eps = (x - ab.sqrt() * x0) / (1 - ab).sqrt()
-            if i == len(ts) - 1:
-                x = x0
-                break
-            ab_prev = ab_all[ts[i + 1]]
-            sigma = eta * ((1 - ab_prev) / (1 - ab) * (1 - ab / ab_prev)).sqrt()
-            x = ab_prev.sqrt() * x0 + (1 - ab_prev - sigma ** 2).clamp(min=0).sqrt() * eps
-            if eta > 0:
-                x = x + sigma * randn()
+            x = ddim_step(x, v, ab_all[t], ab_all[ts[i + 1]] if i < len(ts) - 1 else None, eta, 1.0, randn)
+        return x
+
+
+def ddim_step(x, v, ab, ab_prev, eta=0.0, clip=1.0, randn=None):
+    """One DDIM update from v-prediction ``v``; ``ab_prev=None`` returns the predicted x0 (last step).
+    ``clip``: clamp x0 to [-clip, clip] (None = no clamp)."""
+    x0 = ab.sqrt() * x - (1 - ab).sqrt() * v
+    if clip is not None:
+        x0 = x0.clamp(-clip, clip)
+    if ab_prev is None:
+        return x0
+    eps = (x - ab.sqrt() * x0) / (1 - ab).sqrt()
+    sigma = eta * ((1 - ab_prev) / (1 - ab) * (1 - ab / ab_prev)).sqrt()
+    x = ab_prev.sqrt() * x0 + (1 - ab_prev - sigma ** 2).clamp(min=0).sqrt() * eps
+    return x + sigma * randn() if eta > 0 else x
+
+
+class SeqDiffusion(Diffusion):
+    """The same diffusion over padded point sequences (v3, docs/DESIGN_v3.md).
+
+    x0: (B, L, C). The condition dict also carries ``feat`` (B, L, F) per-point inputs and ``pad``
+    (B, L) bool (True = real point); the model is called as ``model(x, t, cond)``. The loss is
+    averaged over real points only and padded positions are kept at zero. ``clip`` (default None)
+    clamps the predicted x0 during sampling; v3 channels are standardised, not bounded.
+    """
+
+    def loss(self, model, x0, cond, weight=None, noise=None, t=None):
+        B = x0.shape[0]
+        t = torch.randint(0, self.T, (B,), device=x0.device) if t is None else t
+        noise = torch.randn_like(x0) if noise is None else noise
+        pad = cond["pad"][..., None].to(x0.dtype)
+        ab = self.alpha_bar.to(x0.device)[t][:, None, None]
+        xt = (ab.sqrt() * x0 + (1 - ab).sqrt() * noise) * pad
+        v = ab.sqrt() * noise - (1 - ab).sqrt() * x0
+        err = ((model(xt, t, cond).float() - v) ** 2 * pad).sum((1, 2)) / (pad.sum((1, 2)) * x0.shape[2])
+        return err.mean() if weight is None else (err * weight).sum() / weight.sum()
+
+    @torch.no_grad()
+    def sample(self, model, cond, channels, steps=50, guidance=1.0, eta=0.0, generator=None, clip=None):
+        """DDIM with classifier-free guidance; returns (B, L, channels), zero at padded positions.
+        Noise is drawn on the CPU from ``generator`` (same seed, same result on any device)."""
+        pad = cond["pad"][..., None].float()
+        B, L = cond["pad"].shape
+        device = pad.device
+        randn = lambda: torch.randn(B, L, channels, generator=generator).to(device) * pad
+        x = randn()
+        ts = torch.linspace(self.T - 1, 0, steps).round().long().tolist()
+        ab_all = self.alpha_bar.to(device)
+        both = {k: torch.cat([v, v]) for k, v in cond.items()}
+        both["mask"][B:] = False
+        for i, t in enumerate(ts):
+            tt = torch.full((2 * B,), t, device=device, dtype=torch.long)
+            v = model(torch.cat([x, x]), tt, both).float()
+            v = v[B:] + guidance * (v[:B] - v[B:])
+            x = ddim_step(x, v, ab_all[t], ab_all[ts[i + 1]] if i < len(ts) - 1 else None, eta, clip, randn) * pad
         return x

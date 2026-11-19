@@ -160,13 +160,22 @@ _ARR = {}
 
 
 def arrays(shard_dir, shard):
+    """(time, mag, err, offsets) of a shard: memory-mapped ``{shard}.npyd/`` or, without it, ``{shard}.npz``
+    (each array read once)."""
     if shard not in _ARR:
         d = Path(shard_dir) / f"{shard}.npyd"
-        _ARR[shard] = tuple(np.load(d / f"{k}.npy", mmap_mode="r") for k in ("time", "mag", "err", "offsets"))
+        keys = ("time", "mag", "err", "offsets")
+        if d.is_dir():
+            _ARR[shard] = tuple(np.load(d / f"{k}.npy", mmap_mode="r") for k in keys)
+        else:
+            with np.load(Path(shard_dir) / f"{shard}.npz") as z:
+                _ARR[shard] = tuple(z[k] for k in keys)
     return _ARR[shard]
 
 
-def load_star(shard_dir, shard, i):
+def load_star(shard_dir, shard, i, subsample=True):
+    """Finite points of star ``i``; non-positive errors replaced by the median error. Kepler and TESS
+    stars are randomly thinned to SUBSAMPLE points unless ``subsample=False``."""
     t, m, e, off = arrays(shard_dir, shard)
     a, b = int(off[i]), int(off[i + 1])
     t, m, e = np.array(t[a:b], float), np.array(m[a:b], float), np.array(e[a:b], float)
@@ -175,7 +184,7 @@ def load_star(shard_dir, shard, i):
     good = e > 0
     if good.any() and not good.all():
         e[~good] = np.median(e[good])
-    if shard in ("kepler_eb", "tess_eb") and len(t) > SUBSAMPLE:
+    if subsample and shard in ("kepler_eb", "tess_eb") and len(t) > SUBSAMPLE:
         keep = np.sort(np.random.default_rng(seed_of(shard, i)).choice(len(t), SUBSAMPLE, replace=False))
         t, m, e = t[keep], m[keep], e[keep]
     return t, m, e
